@@ -29,6 +29,20 @@ def print_result(issues):
     data = [asdict(issue) for issue in issues]
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
+def print_changed_files(changed_files):
+    data = {
+        "files":[
+            {
+                "path":changed_file.path,
+                "added_lines":len(changed_file.added_lines),
+                "deleted_lines":len(changed_file.deleted_lines),
+                "patch":changed_file.patch,
+            }
+            for changed_file in changed_files
+        ]
+    }
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
 def main():
     args = parse_args()
 
@@ -37,7 +51,8 @@ def main():
     changed_files = parse_diff(diff_text)
     issues = review_changed_files(changed_files)
 
-    print_result(issues)
+    # print_result(issues)
+    print_changed_files(changed_files)
 
 
 if __name__ == "__main__":

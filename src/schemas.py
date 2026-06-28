@@ -17,6 +17,8 @@ class DiffLine:
 class ChangedFile:
     path:str
     added_lines:List[DiffLine]
+    deleted_lines:List[DiffLine]
+    patch:str
 
 @dataclass
 class ReviewIssue:

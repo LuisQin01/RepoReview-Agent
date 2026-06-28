@@ -6,4 +6,5 @@ index 123..456 100644
  def login(user):
 +    print(user.password)
 +    token = "abc123"
+-    old_debug = True
      return True

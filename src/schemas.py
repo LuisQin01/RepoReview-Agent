@@ -39,3 +39,15 @@ class ReviewIssue:
     message:str
     suggestion:str
 
+@dataclass
+class FileContext:
+    '''
+    用来存储某个文件的上下文信息
+    '''
+    path:str
+    exists: bool
+    content: str
+    truncated: bool
+    chars_read:int
+    error:str=""
+

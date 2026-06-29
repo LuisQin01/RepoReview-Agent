@@ -40,7 +40,7 @@ def parse_diff(diff_text:str):
                         path=current_file,
                         added_lines=current_added_lines,
                         deleted_lines=current_deleted_lines,
-                        patch="\n".join(current_patch_line),
+                        patch="\n".join(current_patch_lines),
                     )
                 )
             parts = line.split()

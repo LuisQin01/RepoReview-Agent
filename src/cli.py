@@ -84,16 +84,16 @@ def main():
     diff_text = read_diff(args.diff)
 
     changed_files = parse_diff(diff_text)
-    # issues = review_changed_files(changed_files)
+    issues = review_changed_files(changed_files)
     contexts = collect_file_contexts(
         repo_root=args.repo,
         changed_files=changed_files,
         max_chars=args.max_context_chars,
     )
 
-    # print_result(issues)
+    print_result(issues)
     # print_changed_files(changed_files)
-    print_review_input(changed_files, contexts)
+    # print_review_input(changed_files, contexts)
 
 
 if __name__ == "__main__":

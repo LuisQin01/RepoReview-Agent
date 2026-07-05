@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from dataclasses import asdict
 
+from .reporter import render_json_report, render_markdown_report
+
 from .reviewers import review_changed_files
 from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
@@ -28,6 +30,16 @@ def parse_args():
         default=4000,
         help="Maximum number of characters to read from each file for context",
     )
+    parser.add_argument(
+        "--format",
+        choices=["json", "markdown"],
+        default="markdown",
+    )
+
+    parser.add_argument(
+        "--output",
+        help="Path to save file. If not specified, print to stdout.",
+    )
 
     # 检查参数合法性
     args = parser.parse_args()
@@ -40,6 +52,14 @@ def parse_args():
 
 def read_diff(diff_path):
     return Path(diff_path).read_text(encoding="utf-8")
+
+def write_output(output, output_path):
+    if output_path:
+        path=Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output, encoding="utf-8")
+    else:
+        print(output)
 
 def print_result(issues):
     data = [asdict(issue) for issue in issues]
@@ -84,14 +104,24 @@ def main():
     diff_text = read_diff(args.diff)
 
     changed_files = parse_diff(diff_text)
-    issues = review_changed_files(changed_files)
+    
     contexts = collect_file_contexts(
         repo_root=args.repo,
         changed_files=changed_files,
         max_chars=args.max_context_chars,
     )
+    
+    issues = review_changed_files(changed_files)
 
-    print_result(issues)
+    if args.format == "json":
+        output = render_json_report(issues)
+    else:
+        output = render_markdown_report(issues, changed_files, contexts)
+
+    
+    write_output(output, args.output)
+
+    # print_result(issues)
     # print_changed_files(changed_files)
     # print_review_input(changed_files, contexts)
 

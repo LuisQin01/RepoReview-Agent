@@ -17,6 +17,7 @@ from .reporter import render_json_report, render_markdown_report
 from .reviewers import review_changed_files
 from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
+from .llm_reviewer import review_with_llm
 
 
 def parse_args():
@@ -178,17 +179,20 @@ def run_review_agent(args):
     })
 
     if state.use_llm:
-        from .llm_reviewer import review_with_llm
-        state.llm_issues = review_with_llm(
+        state.llm_issues, validation = review_with_llm(
             changed_files=state.changed_files,
             contexts=state.contexts,
             rule_issues=state.rule_issues,
             call_model=mock_call_model,
         )
+        state.errors.extend(validation.errors)
         state.issues.extend(state.llm_issues)
         record_step(state, "run_llm_review",{
             "called":state.use_llm,
             "findings":len(state.llm_issues),
+            "valid":validation.valid,
+            "repaired":validation.repaired,
+            "errors":validation.errors,
         })
     else:
         record_step(state, "run_llm_review",{

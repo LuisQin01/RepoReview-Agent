@@ -2,6 +2,7 @@ import json
 from dataclasses import asdict
 
 from .schemas import ReviewIssue
+from .validation import validate_llm_response
 
 def build_llm_prompt(changed_files, contexts, rule_issues):
     payload={
@@ -58,21 +59,21 @@ def _severity_from_llm(severity):
     return mapping.get(severity, "warning")
 
 def parse_llm_response(response_text):
-    data = json.loads(response_text)
+    validation = validate_llm_response(response_text)
 
     issues = []
-    for finding in data.get("findings",[]):
+    for finding in validation.findings:
         issues.append(
             ReviewIssue(
-                file_path=finding.get("file","(unknown)"),
-                line_no=int(finding.get("line") or 0),
-                severity=_severity_from_llm(finding.get("severity")),
+                file_path=finding["file"],
+                line_no=int(finding["line"] or 0),
+                severity=_severity_from_llm(finding["severity"]),
                 category="llm",
-                message=finding.get("issue",""),
-                suggestion=finding.get("suggested_fix","")
+                message=finding["issue"],
+                suggestion=finding["suggested_fix"]
             )
         )
-    return issues
+    return issues, validation
 
 def review_with_llm(changed_files, contexts, rule_issues, call_model):
     prompt=build_llm_prompt(

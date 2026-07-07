@@ -1,4 +1,4 @@
-'''
+﻿'''
 作为命令行的入口，用来负责把用户的输入接入进来
 功能：
 1. 读取参数
@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument(
         "--output",
         help="Path to save file. If not specified, print to stdout.",
+    )
+
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Enable LLM reviewer",
     )
 
     # 检查参数合法性
@@ -97,33 +103,116 @@ def print_review_input(changed_files, contexts):
     }
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
+def record_step(trace_steps, step, detail=None):
+    trace_steps.append({
+        "step":step,
+        "detail":detail or {},
+    })
 
-def main():
-    args = parse_args()
-    
+def validate_issues(issues):
+    if not isinstance(issues, list):
+        raise ValueError("Issues should be a list")
+    return issues
+
+def mock_call_model(prompt):
+    return """
+{
+    "findings": [
+            {
+                "severity": "high",
+                "file": "app.py",
+                "line": 10,
+                "issue": "这里缺少异常处理",
+                "reason": "新增代码可能执行失败，但没有看到错误处理逻辑",
+                "suggested_fix": "为可能失败的调用添加 try/except 或向上抛出明确异常",
+                "confidence": 0.76
+            }
+        ]
+}
+"""
+
+def run_review_agent(args):
+    trace_steps = []
+
+    # 首先记录接收到的任务参数
+    record_step(trace_steps, "receive_task",{
+        "diff":args.diff,
+        "repo":args.repo,
+        "format":args.format,
+        "llm":args.llm,
+    })
+
+    # 读取 diff 文件
     diff_text = read_diff(args.diff)
 
+    # 解析 diff，得到结构化的 changed_files
     changed_files = parse_diff(diff_text)
-    
+    # 记录解析 diff 的结果
+    record_step(trace_steps, "parse_diff",{
+        "changed_files":len(changed_files),
+    })
+
+    # 收集文件上下文，diff只告诉你修改了哪些行，但没有告诉你这些行的上下文是什么样的
     contexts = collect_file_contexts(
         repo_root=args.repo,
         changed_files=changed_files,
         max_chars=args.max_context_chars,
     )
-    
-    issues = review_changed_files(changed_files)
+    record_step(trace_steps, "collect_context",{
+        "contexts":len(contexts),
+    })
+
+    # 根据规则检查 changed_files，得到 rule_issues
+    rule_issues=review_changed_files(changed_files)
+    issues=list(rule_issues)
+    record_step(trace_steps, "run_static_checks",{
+        "findings":len(issues),
+    })
+
+    if args.llm:
+        from .llm_reviewer import review_with_llm
+        llm_issues = review_with_llm(
+            changed_files=changed_files,
+            contexts=contexts,
+            rule_issues=rule_issues,
+            call_model=mock_call_model,
+        )
+        issues.extend(llm_issues)
+        record_step(trace_steps, "run_llm_review",{
+            "called":True,
+            "findings":len(llm_issues),
+        })
+    else:
+        record_step(trace_steps, "run_llm_review",{
+            "called":False,
+        })
+
+    issues = validate_issues(issues)
+    record_step(trace_steps, "validate_output",{
+        "findings":len(issues),
+    })
 
     if args.format == "json":
         output = render_json_report(issues)
     else:
         output = render_markdown_report(issues, changed_files, contexts)
 
-    
-    write_output(output, args.output)
+    record_step(trace_steps, "render_report",{
+        "format":args.format,
+    })
 
-    # print_result(issues)
-    # print_changed_files(changed_files)
-    # print_review_input(changed_files, contexts)
+    record_step(trace_steps, "save_trace",{
+        "enabled": False,
+        "reason": "后面再实现trace文件落盘"
+    })
+
+    return output, trace_steps
+
+def main():
+    args = parse_args()
+
+    output, trace_steps = run_review_agent(args)
+    write_output(output, args.output)
 
 
 if __name__ == "__main__":

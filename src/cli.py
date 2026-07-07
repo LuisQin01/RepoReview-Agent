@@ -103,8 +103,8 @@ def print_review_input(changed_files, contexts):
     }
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
-def record_step(trace_steps, step, detail=None):
-    trace_steps.append({
+def record_step(state, step, detail=None):
+    state.trace_steps.append({
         "step":step,
         "detail":detail or {},
     })
@@ -132,81 +132,89 @@ def mock_call_model(prompt):
 """
 
 def run_review_agent(args):
-    trace_steps = []
+    from .agent_state import ReviewState
+
+    state = ReviewState(
+        diff_path=args.diff,
+        repo_root=args.repo,
+        output_format=args.format,
+        use_llm=args.llm,
+        max_context_chars=args.max_context_chars
+    )
 
     # 首先记录接收到的任务参数
-    record_step(trace_steps, "receive_task",{
-        "diff":args.diff,
-        "repo":args.repo,
-        "format":args.format,
-        "llm":args.llm,
+    record_step(state, "receive_task",{
+        "diff":state.diff_path,
+        "repo":state.repo_root,
+        "format":state.output_format,
+        "llm":state.use_llm,
     })
 
     # 读取 diff 文件
-    diff_text = read_diff(args.diff)
+    state.diff_text = read_diff(state.diff_path)
 
     # 解析 diff，得到结构化的 changed_files
-    changed_files = parse_diff(diff_text)
+    state.changed_files = parse_diff(state.diff_text)
     # 记录解析 diff 的结果
-    record_step(trace_steps, "parse_diff",{
-        "changed_files":len(changed_files),
+    record_step(state, "parse_diff",{
+        "changed_files":len(state.changed_files),
     })
 
     # 收集文件上下文，diff只告诉你修改了哪些行，但没有告诉你这些行的上下文是什么样的
-    contexts = collect_file_contexts(
-        repo_root=args.repo,
-        changed_files=changed_files,
-        max_chars=args.max_context_chars,
+    state.contexts = collect_file_contexts(
+        repo_root=state.repo_root,
+        changed_files=state.changed_files,
+        max_chars=state.max_context_chars,
     )
-    record_step(trace_steps, "collect_context",{
-        "contexts":len(contexts),
+    record_step(state, "collect_context",{
+        "contexts":len(state.contexts),
     })
 
     # 根据规则检查 changed_files，得到 rule_issues
-    rule_issues=review_changed_files(changed_files)
-    issues=list(rule_issues)
-    record_step(trace_steps, "run_static_checks",{
-        "findings":len(issues),
+    state.rule_issues=review_changed_files(state.changed_files)
+    state.issues=list(state.rule_issues)
+    record_step(state, "run_static_checks",{
+        "findings":len(state.issues),
     })
 
-    if args.llm:
+    if state.use_llm:
         from .llm_reviewer import review_with_llm
-        llm_issues = review_with_llm(
-            changed_files=changed_files,
-            contexts=contexts,
-            rule_issues=rule_issues,
+        state.llm_issues = review_with_llm(
+            changed_files=state.changed_files,
+            contexts=state.contexts,
+            rule_issues=state.rule_issues,
             call_model=mock_call_model,
         )
-        issues.extend(llm_issues)
-        record_step(trace_steps, "run_llm_review",{
-            "called":True,
-            "findings":len(llm_issues),
+        state.issues.extend(state.llm_issues)
+        record_step(state, "run_llm_review",{
+            "called":state.use_llm,
+            "findings":len(state.llm_issues),
         })
     else:
-        record_step(trace_steps, "run_llm_review",{
+        record_step(state, "run_llm_review",{
             "called":False,
         })
 
-    issues = validate_issues(issues)
-    record_step(trace_steps, "validate_output",{
-        "findings":len(issues),
+    state.issues = validate_issues(state.issues)
+    record_step(state, "validate_output",{
+        "findings":len(state.issues),
     })
 
-    if args.format == "json":
-        output = render_json_report(issues)
+    if state.output_format == "json":
+        state.output = render_json_report(state.issues)
     else:
-        output = render_markdown_report(issues, changed_files, contexts)
+        state.output = render_markdown_report(state.issues, state.changed_files, state.contexts)
 
-    record_step(trace_steps, "render_report",{
-        "format":args.format,
+    record_step(state, "render_report",{
+        "format":state.output_format,
     })
 
-    record_step(trace_steps, "save_trace",{
+    record_step(state, "save_trace",{
         "enabled": False,
         "reason": "后面再实现trace文件落盘"
     })
 
-    return output, trace_steps
+    return state.output, state.trace_steps
 
 def main():
     args = parse_args()

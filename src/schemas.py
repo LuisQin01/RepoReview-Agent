@@ -51,3 +51,10 @@ class FileContext:
     chars_read:int
     error:str=""
 
+@dataclass
+class LLMReviewResult:
+    issue: List[ReviewIssue]
+    raw_output: str
+    valid: bool
+    repaired: bool=False
+    error: str=""

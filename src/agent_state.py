@@ -12,6 +12,7 @@ class ReviewState:
     output_format:str
     use_llm:bool
     max_context_chars:int
+    max_extra_context_files:int=3
     llm_provider:str="mock"
 
     diff_text:str=""

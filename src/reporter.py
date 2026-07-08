@@ -1,4 +1,4 @@
-'''
+﻿'''
 reporter.py负责展示结果，把问题列表变成markdown文本，或者json文本
 reviewers.py负责审查代码
 '''
@@ -55,6 +55,7 @@ def render_markdown_report(issues, changed_files, contexts):
         context.path:context
         for context in contexts
     }
+    changed_paths={changed_file.path for changed_file in changed_files}
     lines=[
         "# Repo Review Report",
         "",
@@ -88,6 +89,35 @@ def render_markdown_report(issues, changed_files, contexts):
             )
             + " |"
         )
+
+    lines.extend([
+        "",
+        "## Context Files",
+        "",
+    ])
+
+    if not contexts:
+        lines.append("No context files collected.")
+    else:
+        lines.extend([
+            "| File | Type | Status |",
+            "| --- | --- | --- |",
+        ])
+
+        for context in contexts:
+            context_type="changed" if context.path in changed_paths else "related"
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _escape_table_cell(context.path),
+                        context_type,
+                        _escape_table_cell(_context_status(context)),
+                    ]
+                )
+                + " |"
+            )
+
 
     lines.extend([
         "",

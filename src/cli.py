@@ -69,12 +69,22 @@ def parse_args():
         help="Directory to save trace files",
     )
 
+    parser.add_argument(
+    "--max-extra-context-files",
+    type=int,
+    default=3,
+    help="Maximum number of extra related files to read for context",
+    )
+
     # 检查参数合法性
     args = parser.parse_args()
     
     # 检查 max_context_chars 是否大于0
     if args.max_context_chars <= 0:
         parser.error("--max-context-chars must be greater than 0")
+
+    if args.max_extra_context_files < 0:
+        parser.error("--max-extra-context-files must be greater than or equal to 0")
 
     return args
 
@@ -168,6 +178,7 @@ def run_review_agent(args):
         llm_provider=args.llm_provider,
         trace_enabled=args.trace,
         trace_dir=args.trace_dir,
+        max_extra_context_files=args.max_extra_context_files,
     )
 
     # 首先记录接收到的任务参数
@@ -194,6 +205,7 @@ def run_review_agent(args):
         repo_root=state.repo_root,
         changed_files=state.changed_files,
         max_chars=state.max_context_chars,
+        max_extra_files=args.max_extra_context_files,
     )
     record_step(state, "collect_context",{
         "contexts":len(state.contexts),

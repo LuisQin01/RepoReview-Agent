@@ -10,6 +10,7 @@ class ReviewState:
     output_format:str
     use_llm:bool
     max_context_chars:int
+    llm_provider:str="mock"
 
     diff_text:str=""
     changed_files:List[ChangedFile]=field(default_factory=list)

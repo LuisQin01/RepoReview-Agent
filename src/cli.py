@@ -18,6 +18,7 @@ from .reviewers import review_changed_files
 from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
 from .llm_reviewer import review_with_llm
+from .llm_client import get_call_model, LLMClientError
 
 
 def parse_args():
@@ -46,6 +47,13 @@ def parse_args():
         "--llm",
         action="store_true",
         help="Enable LLM reviewer",
+    )
+
+    parser.add_argument(
+        "--llm-provider",
+        choices=["mock","openai"],
+        default="mock",
+        help="LLM provider to use when --llm is enabled",
     )
 
     # 检查参数合法性
@@ -140,7 +148,8 @@ def run_review_agent(args):
         repo_root=args.repo,
         output_format=args.format,
         use_llm=args.llm,
-        max_context_chars=args.max_context_chars
+        max_context_chars=args.max_context_chars,
+        llm_provider=args.llm_provider,
     )
 
     # 首先记录接收到的任务参数
@@ -149,6 +158,7 @@ def run_review_agent(args):
         "repo":state.repo_root,
         "format":state.output_format,
         "llm":state.use_llm,
+        "llm_provider":state.llm_provider,
     })
 
     # 读取 diff 文件
@@ -179,21 +189,34 @@ def run_review_agent(args):
     })
 
     if state.use_llm:
-        state.llm_issues, validation = review_with_llm(
-            changed_files=state.changed_files,
-            contexts=state.contexts,
-            rule_issues=state.rule_issues,
-            call_model=mock_call_model,
-        )
-        state.errors.extend(validation.errors)
-        state.issues.extend(state.llm_issues)
-        record_step(state, "run_llm_review",{
-            "called":state.use_llm,
-            "findings":len(state.llm_issues),
-            "valid":validation.valid,
-            "repaired":validation.repaired,
-            "errors":validation.errors,
-        })
+        try:    
+            call_model=get_call_model(state.llm_provider)
+
+            state.llm_issues, validation = review_with_llm(
+                changed_files=state.changed_files,
+                contexts=state.contexts,
+                rule_issues=state.rule_issues,
+                call_model=call_model,
+            )
+            state.errors.extend(validation.errors)
+            state.issues.extend(state.llm_issues)
+
+            record_step(state, "run_llm_review",{
+                "called":True,
+                "provider":state.llm_provider,
+                "findings":len(state.llm_issues),
+                "valid":validation.valid,
+                "repaired":validation.repaired,
+                "errors":validation.errors,
+            })
+        except LLMClientError as exc:
+            state.errors.append(str(exc))
+            record_step(state, "run_llm_review",{
+                "called":True,
+                "provider":state.llm_provider,
+                "findings":0,
+                "error":str(exc),
+            })
     else:
         record_step(state, "run_llm_review",{
             "called":False,

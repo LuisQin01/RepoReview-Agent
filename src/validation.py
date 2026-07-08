@@ -77,6 +77,19 @@ def validate_llm_response(response_text: str) -> ValidationResult:
             normalized["confidence"] = 0.5
             result.repaired = True
             result.errors.append(f"llm_finding_{index}_missing_confidence")
+
+        # 增加类型转换和范围限制
+        try:
+            normalized["confidence"]=float(normalized.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            normalized["confidence"]=0.5
+            result.repaired=True
+            result.errors.append(f"llm_finding_{index}_invalid_confidence")
+        
+        if normalized["confidence"]<0 or normalized["confidence"]>1:
+            normalized["confidence"]=max(0.0,min(1.0, normalized["confidence"]))
+            result.repaired=True
+            result.errors.append(f"llm_finding_{index}_confidence_out_of_range")
     
         # 确保每个发现都有 issue、reason 和 suggested_fix 字段，如果缺少则修复为默认值
         for field_name in ["issue", "reason", "suggested_fix"]:

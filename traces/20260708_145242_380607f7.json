@@ -1,0 +1,92 @@
+{
+  "task_id": "380607f7",
+  "steps": [
+    {
+      "step": "receive_task",
+      "elapsed_ms": 0,
+      "detail": {
+        "diff": "examples\\simple.diff",
+        "repo": ".",
+        "format": "markdown",
+        "llm": true,
+        "llm_provider": "mock"
+      }
+    },
+    {
+      "step": "parse_diff",
+      "elapsed_ms": 0,
+      "detail": {
+        "changed_files": 1
+      }
+    },
+    {
+      "step": "collect_context",
+      "elapsed_ms": 1,
+      "detail": {
+        "contexts": 1
+      }
+    },
+    {
+      "step": "run_static_checks",
+      "elapsed_ms": 1,
+      "detail": {
+        "findings": 10
+      }
+    },
+    {
+      "step": "run_llm_review",
+      "elapsed_ms": 2,
+      "detail": {
+        "called": true,
+        "provider": "mock",
+        "findings": 1,
+        "valid": true,
+        "repaired": false,
+        "errors": []
+      }
+    },
+    {
+      "step": "validate_output",
+      "elapsed_ms": 2,
+      "detail": {
+        "findings": 11
+      }
+    },
+    {
+      "step": "render_report",
+      "elapsed_ms": 2,
+      "detail": {
+        "format": "markdown"
+      }
+    },
+    {
+      "step": "save_trace",
+      "elapsed_ms": 2,
+      "detail": {
+        "enabled": false,
+        "trace_dir": "traces"
+      }
+    }
+  ],
+  "input_files": [
+    {
+      "path": "app.py",
+      "added_lines": 6,
+      "deleted_lines": 375
+    }
+  ],
+  "context_files": [
+    {
+      "path": "app.py",
+      "exists": false,
+      "chars_read": 0,
+      "truncated": false,
+      "error": "File app.py does not exist"
+    }
+  ],
+  "llm_called": true,
+  "llm_provider": "mock",
+  "findings_count": 11,
+  "duration_ms": 3,
+  "errors": []
+}

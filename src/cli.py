@@ -11,6 +11,7 @@ import argparse
 import json
 from pathlib import Path
 from dataclasses import asdict
+from time import perf_counter
 
 from .reporter import render_json_report, render_markdown_report
 
@@ -54,6 +55,18 @@ def parse_args():
         choices=["mock","openai"],
         default="mock",
         help="LLM provider to use when --llm is enabled",
+    )
+
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Save trace json after review",
+    )
+
+    parser.add_argument(
+        "--trace-dir",
+        default="traces",
+        help="Directory to save trace files",
     )
 
     # 检查参数合法性
@@ -113,8 +126,10 @@ def print_review_input(changed_files, contexts):
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 def record_step(state, step, detail=None):
+    elapsed_ms=int((perf_counter()-state.started_at_perf)*1000)
     state.trace_steps.append({
         "step":step,
+        "elapsed_ms":elapsed_ms,
         "detail":detail or {},
     })
 
@@ -142,6 +157,7 @@ def mock_call_model(prompt):
 
 def run_review_agent(args):
     from .agent_state import ReviewState
+    from .trace import save_trace
 
     state = ReviewState(
         diff_path=args.diff,
@@ -150,6 +166,8 @@ def run_review_agent(args):
         use_llm=args.llm,
         max_context_chars=args.max_context_chars,
         llm_provider=args.llm_provider,
+        trace_enabled=args.trace,
+        trace_dir=args.trace_dir,
     )
 
     # 首先记录接收到的任务参数
@@ -236,10 +254,16 @@ def run_review_agent(args):
         "format":state.output_format,
     })
 
-    record_step(state, "save_trace",{
-        "enabled": False,
-        "reason": "后面再实现trace文件落盘"
-    })
+    if state.trace_enabled:
+        record_step(state, "save_trace",{
+            "enabled": True,
+            "trace_dir": state.trace_dir,
+        })
+        save_trace(state, state.trace_dir)
+    else:
+        record_step(state, "save_trace",{
+            "enabled":False,
+        })
 
     return state.output, state.trace_steps
 

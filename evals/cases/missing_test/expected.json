@@ -1,0 +1,5 @@
+{
+  "case_id": "missing_test",
+  "expected_categories": ["test_gap"],
+  "should_find": true
+}

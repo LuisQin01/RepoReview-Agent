@@ -1,0 +1,11 @@
+diff --git a/src/parser.py b/src/parser.py
+index 111..222 100644
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -1,7 +1,3 @@
+ def parse_json(text):
+-    try:
+-        return json.loads(text)
+-    except ValueError:
+-        return {}
++    return json.loads(text)

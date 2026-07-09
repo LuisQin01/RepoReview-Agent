@@ -1,0 +1,5 @@
+{
+  "case_id": "deleted_exception_handling",
+  "expected_categories": ["exception_handling"],
+  "should_find": true
+}

@@ -1,0 +1,5 @@
+{
+  "case_id": "hardcoded_secret",
+  "expected_categories": ["secret"],
+  "should_find": true
+}

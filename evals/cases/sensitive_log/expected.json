@@ -1,0 +1,5 @@
+{
+  "case_id": "sensitive_log",
+  "expected_categories": ["sensitive_log"],
+  "should_find": true
+}

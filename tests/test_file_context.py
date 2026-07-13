@@ -20,6 +20,106 @@ def test_read_file_context_rejects_outside_repo(tmp_path):
     assert context.exists is False
     assert "outside" in context.error
 
+
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        ".env",
+        ".env.production",
+        ".envrc",
+        "keys/id_rsa",
+        "certificates/service.pem",
+        "certificates/service.key",
+        "certificates/service.crt",
+        "certificates/service.cer",
+        "certificates/service.pfx",
+        "config/production.yaml",
+        "CONFIG/nested/PROD.JSON",
+        "deploy/values.yaml",
+        "DEPLOY/nested/VALUES.YML",
+        "settings.json",
+    ],
+)
+def test_read_file_context_skips_sensitive_files_without_reading_content(tmp_path, file_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / file_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("API_KEY=secret\n", encoding="utf-8")
+
+    context = read_file_context(repo, file_path, max_chars=100)
+
+    assert context.exists is False
+    assert context.content == ""
+    assert context.chars_read == 0
+    assert "sensitive" in context.error
+
+
+def test_read_file_context_does_not_reject_non_sensitive_filename_containing_key(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "monkey.py").write_text("value = 1\n", encoding="utf-8")
+
+    context = read_file_context(repo, "monkey.py", max_chars=100)
+
+    assert context.exists is True
+    assert context.content == "value = 1\n"
+
+
+def test_read_file_context_keeps_non_sensitive_configuration_readable(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "openapi.yaml"
+    config.write_text("feature_enabled: true\n", encoding="utf-8")
+
+    context = read_file_context(repo, "openapi.yaml", max_chars=100)
+
+    assert context.exists is True
+    assert context.content == "feature_enabled: true\n"
+
+
+def test_read_file_context_skips_all_config_yaml_under_config_dir(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "config" / "development.yaml"
+    config.parent.mkdir()
+    config.write_text("api_key: secret\n", encoding="utf-8")
+
+    context = read_file_context(repo, "config/development.yaml", max_chars=100)
+
+    assert context.exists is False
+    assert context.content == ""
+    assert context.chars_read == 0
+    assert "sensitive" in context.error
+
+
+def test_collect_file_contexts_preserves_sensitive_file_provenance_without_content(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    changed_file = ChangedFile(
+        path=".env",
+        added_lines=[DiffLine(file_path=".env", line_no=1, content="+API_KEY=secret")],
+        deleted_lines=[],
+        patch="@@ -0,0 +1,1 @@\n+API_KEY=secret\n",
+        hunks=[DiffHunk(start_line=1, end_line=1)],
+    )
+
+    contexts = collect_file_contexts(
+        repo,
+        [changed_file],
+        context_budget=ContextBudget(max_prompt_chars=100, max_extra_context_files=0),
+    )
+
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.path == ".env"
+    assert context.exists is False
+    assert context.content == ""
+    assert context.chars_read == 0
+    assert context.source == "changed_file"
+    assert context.selection_reason == "file is changed in the pull request"
+
 def test_read_file_context_truncates_large_file(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -199,66 +299,6 @@ def test_collect_file_contexts_applies_remaining_budget_to_extra_files(tmp_path)
     assert contexts[1].truncated is True
 
 
-def test_context_budget_rejects_invalid_limits():
-    with pytest.raises(ValueError, match="max_prompt_chars"):
-        ContextBudget(max_prompt_chars=0)
-
-    with pytest.raises(ValueError, match="max_extra_context_files"):
-        ContextBudget(max_extra_context_files=-1)
-
-
-def test_locate_python_symbol_returns_containing_function():
-    source = """def calculate_total(values):
-    total = sum(values)
-    return total
-
-
-class Ignored:
-    pass
-"""
-
-    symbol = locate_python_symbol(source, 2)
-
-    assert symbol is not None
-    assert symbol.name == "calculate_total"
-    assert symbol.kind == "function"
-    assert symbol.qualified_name == "calculate_total"
-    assert symbol.class_name is None
-    assert (symbol.start_line, symbol.end_line) == (1, 3)
-    assert symbol.source == "def calculate_total(values):\n    total = sum(values)\n    return total\n"
-
-
-def test_locate_python_symbol_distinguishes_method_and_class():
-    source = """class Processor:
-    setting = "safe"
-
-    def handle(self, value):
-        return value + 1
-"""
-
-    method = locate_python_symbol(source, 5)
-    containing_class = locate_python_symbol(source, 2)
-
-    assert method is not None
-    assert method.name == "handle"
-    assert method.kind == "method"
-    assert method.qualified_name == "Processor.handle"
-    assert method.class_name == "Processor"
-    assert (method.start_line, method.end_line) == (4, 5)
-    assert method.source == "    def handle(self, value):\n        return value + 1\n"
-
-    assert containing_class is not None
-    assert containing_class.name == "Processor"
-    assert containing_class.kind == "class"
-    assert (containing_class.start_line, containing_class.end_line) == (1, 5)
-
-
-def test_locate_python_symbol_returns_none_for_unlocatable_source_or_line():
-    assert locate_python_symbol("def broken(:\n", 1) is None
-    assert locate_python_symbol("value = 1\n", 1) is None
-    assert locate_python_symbol("def valid():\n    return 1\n", 0) is None
-
-
 def test_collect_file_contexts_records_provenance_for_each_selection_path(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -352,3 +392,63 @@ def test_collect_file_contexts_keeps_provenance_when_selected_file_cannot_be_rea
     assert context.source == "changed_file"
     assert context.selection_reason == "file is changed in the pull request"
     assert "does not exist" in context.error
+
+
+def test_context_budget_rejects_invalid_limits():
+    with pytest.raises(ValueError, match="max_prompt_chars"):
+        ContextBudget(max_prompt_chars=0)
+
+    with pytest.raises(ValueError, match="max_extra_context_files"):
+        ContextBudget(max_extra_context_files=-1)
+
+
+def test_locate_python_symbol_returns_containing_function():
+    source = """def calculate_total(values):
+    total = sum(values)
+    return total
+
+
+class Ignored:
+    pass
+"""
+
+    symbol = locate_python_symbol(source, 2)
+
+    assert symbol is not None
+    assert symbol.name == "calculate_total"
+    assert symbol.kind == "function"
+    assert symbol.qualified_name == "calculate_total"
+    assert symbol.class_name is None
+    assert (symbol.start_line, symbol.end_line) == (1, 3)
+    assert symbol.source == "def calculate_total(values):\n    total = sum(values)\n    return total\n"
+
+
+def test_locate_python_symbol_distinguishes_method_and_class():
+    source = """class Processor:
+    setting = "safe"
+
+    def handle(self, value):
+        return value + 1
+"""
+
+    method = locate_python_symbol(source, 5)
+    containing_class = locate_python_symbol(source, 2)
+
+    assert method is not None
+    assert method.name == "handle"
+    assert method.kind == "method"
+    assert method.qualified_name == "Processor.handle"
+    assert method.class_name == "Processor"
+    assert (method.start_line, method.end_line) == (4, 5)
+    assert method.source == "    def handle(self, value):\n        return value + 1\n"
+
+    assert containing_class is not None
+    assert containing_class.name == "Processor"
+    assert containing_class.kind == "class"
+    assert (containing_class.start_line, containing_class.end_line) == (1, 5)
+
+
+def test_locate_python_symbol_returns_none_for_unlocatable_source_or_line():
+    assert locate_python_symbol("def broken(:\n", 1) is None
+    assert locate_python_symbol("value = 1\n", 1) is None
+    assert locate_python_symbol("def valid():\n    return 1\n", 0) is None

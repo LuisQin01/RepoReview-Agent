@@ -1,10 +1,12 @@
 import json
 from dataclasses import asdict
 
+from .file_context import _is_sensitive_file_path
 from .schemas import ContextBudget, ReviewIssue
 from .validation import validate_llm_response
 
 _TRUNCATION_MARKER = "\n[TRUNCATED: prompt budget reached]\n"
+_REDACTED_DIFF_PLACEHOLDER = "[REDACTED: sensitive file diff suppressed]"
 
 
 def _apply_prompt_budget(prompt, max_prompt_chars):
@@ -19,6 +21,23 @@ def _apply_prompt_budget(prompt, max_prompt_chars):
     if max_prompt_chars < len(_TRUNCATION_MARKER):
         return "…"[:max_prompt_chars]
     return prompt[:max_prompt_chars - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _sanitize_changed_file_for_prompt(changed_file):
+    # Diffs arrive from git and bypass read_file_context, so redact sensitive paths here.
+    if _is_sensitive_file_path(changed_file.path):
+        return {
+            "path": changed_file.path,
+            "patch": _REDACTED_DIFF_PLACEHOLDER,
+            "added_lines": [],
+            "deleted_lines": [],
+        }
+    return {
+        "path": changed_file.path,
+        "patch": changed_file.patch,
+        "added_lines": [asdict(line) for line in changed_file.added_lines],
+        "deleted_lines": [asdict(line) for line in changed_file.deleted_lines],
+    }
 
 
 def build_llm_prompt(
@@ -39,12 +58,7 @@ def build_llm_prompt(
 
     payload={
         "changed_files":[
-            {
-                "path":changed_file.path,
-                "patch":changed_file.patch,
-                "added_lines":[asdict(line) for line in changed_file.added_lines],
-                "deleted_lines":[asdict(line) for line in changed_file.deleted_lines],
-            }
+            _sanitize_changed_file_for_prompt(changed_file)
             for changed_file in changed_files
         ],
         "contexts":[asdict(context) for context in contexts],
@@ -131,6 +145,6 @@ def review_with_llm(
         rule_issues=rule_issues,
         max_prompt_chars=max_prompt_chars,
     )
-
+    
     response_text=call_model(prompt)
     return parse_llm_response(response_text)

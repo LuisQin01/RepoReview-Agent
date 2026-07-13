@@ -12,6 +12,9 @@ from pathlib import Path
 from .schemas import ContextBudget, DiffHunk, FileContext, PythonSymbol
 
 IGNORED_DIRS={".git", "__pycache__", ".venv", "venv", "node_modules", "traces"}
+SENSITIVE_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+SENSITIVE_FILE_SUFFIXES = {".pem", ".key", ".crt", ".cer", ".der", ".p12", ".pfx"}
+SENSITIVE_CONFIG_SUFFIXES = {".yaml", ".yml", ".json"}
 
 
 def locate_python_symbol(source, line_no):
@@ -91,6 +94,27 @@ def _error_context(file_path, message, source="", selection_reason=""):
         selection_reason=selection_reason,
     )
 
+
+def _is_sensitive_file_path(file_path):
+    path = Path(file_path)
+    filename = path.name.lower()
+    suffix = path.suffix.lower()
+    stem = path.stem.lower()
+    parent_parts = {part.lower() for part in path.parts[:-1]}
+    is_sensitive_config = (
+        suffix in SENSITIVE_CONFIG_SUFFIXES
+        and (
+            filename == "settings.json"
+            or "config" in parent_parts
+            or ("deploy" in parent_parts and stem == "values")
+        )
+    )
+    return (
+        filename in SENSITIVE_FILE_NAMES
+        or filename.startswith(".env.")
+        or suffix in SENSITIVE_FILE_SUFFIXES
+        or is_sensitive_config
+    )
 
 def _truncate_to_changed_lines(content, changed_line_nos, max_chars):
     if len(content) <= max_chars:
@@ -213,6 +237,14 @@ def read_file_context(
             selection_reason=selection_reason,
         )
 
+    if _is_sensitive_file_path(file_path):
+        return _error_context(
+            file_path,
+            f"File {file_path} is sensitive and was not read",
+            source=source,
+            selection_reason=selection_reason,
+        )
+    
     # 如果文件不存在，返回错误
     if not target_path.exists():
         return _error_context(

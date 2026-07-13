@@ -63,7 +63,7 @@ def parse_args():
 
     parser.add_argument(
         "--mock-fixture",
-        choices=["normal", "bad_json", "timeout", "empty"],
+        choices=["normal", "bad_json", "timeout", "timeout_then_success", "empty"],
         default="normal",
         help="Mock LLM response fixture to use when --llm-provider=mock",
     )

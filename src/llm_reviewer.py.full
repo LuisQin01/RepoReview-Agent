@@ -25,12 +25,7 @@ def _apply_prompt_budget(prompt, max_prompt_chars):
 
 def _sanitize_changed_file_for_prompt(changed_file):
     # Diffs arrive from git and bypass read_file_context, so redact sensitive paths here.
-    # Check both the new path and the old path (rename source) — a sensitive file
-    # renamed to a non-sensitive name still carries secret content in deleted_lines/patch.
-    if _is_sensitive_file_path(changed_file.path) or (
-        changed_file.old_path
-        and _is_sensitive_file_path(changed_file.old_path)
-    ):
+    if _is_sensitive_file_path(changed_file.path):
         return {
             "path": changed_file.path,
             "patch": _REDACTED_DIFF_PLACEHOLDER,

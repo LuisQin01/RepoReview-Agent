@@ -1,0 +1,2204 @@
+﻿diff --git a/README.md b/README.md
+index a722d50..b2e1bda 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,21 @@
+ # RepoReview Agent
+ 通过参考[The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent)来实现一个Agent项目，用来进行本地代码审查，可以读取git diff和相关上下文来给出结构化的review建议
+ 
++## Setup
++
++The timeout and retry implementation is verified with Python 3.11.7,
++OpenAI SDK 1.109.1, and pytest 7.4.0. Install the declared dependencies:
++
++```powershell
++py -m pip install -r requirements.txt
++```
++
++Run the test suite without calling the OpenAI API:
++
++```powershell
++py -m pytest tests/ -v
++```
++
+ ## Agent Loop
+ 
+ RepoReview Agent uses a fixed-step loop for now:
+diff --git a/src/__pycache__/agent_state.cpython-311.pyc b/src/__pycache__/agent_state.cpython-311.pyc
+index c035b38..efa7745 100644
+Binary files a/src/__pycache__/agent_state.cpython-311.pyc and b/src/__pycache__/agent_state.cpython-311.pyc differ
+diff --git a/src/__pycache__/cli.cpython-311.pyc b/src/__pycache__/cli.cpython-311.pyc
+index 39bb682..528d2d6 100644
+Binary files a/src/__pycache__/cli.cpython-311.pyc and b/src/__pycache__/cli.cpython-311.pyc differ
+diff --git a/src/__pycache__/diff_parser.cpython-311.pyc b/src/__pycache__/diff_parser.cpython-311.pyc
+index 337b907..13c9754 100644
+Binary files a/src/__pycache__/diff_parser.cpython-311.pyc and b/src/__pycache__/diff_parser.cpython-311.pyc differ
+diff --git a/src/__pycache__/eval_runner.cpython-311.pyc b/src/__pycache__/eval_runner.cpython-311.pyc
+index 301329a..196d375 100644
+Binary files a/src/__pycache__/eval_runner.cpython-311.pyc and b/src/__pycache__/eval_runner.cpython-311.pyc differ
+diff --git a/src/__pycache__/file_context.cpython-311.pyc b/src/__pycache__/file_context.cpython-311.pyc
+index 72eeac3..b6ec0bb 100644
+Binary files a/src/__pycache__/file_context.cpython-311.pyc and b/src/__pycache__/file_context.cpython-311.pyc differ
+diff --git a/src/__pycache__/llm_client.cpython-311.pyc b/src/__pycache__/llm_client.cpython-311.pyc
+index 6c866b4..227b392 100644
+Binary files a/src/__pycache__/llm_client.cpython-311.pyc and b/src/__pycache__/llm_client.cpython-311.pyc differ
+diff --git a/src/__pycache__/llm_reviewer.cpython-311.pyc b/src/__pycache__/llm_reviewer.cpython-311.pyc
+index 2c93621..a875bfb 100644
+Binary files a/src/__pycache__/llm_reviewer.cpython-311.pyc and b/src/__pycache__/llm_reviewer.cpython-311.pyc differ
+diff --git a/src/__pycache__/schemas.cpython-311.pyc b/src/__pycache__/schemas.cpython-311.pyc
+index f8b98b4..553fca7 100644
+Binary files a/src/__pycache__/schemas.cpython-311.pyc and b/src/__pycache__/schemas.cpython-311.pyc differ
+diff --git a/src/__pycache__/trace.cpython-311.pyc b/src/__pycache__/trace.cpython-311.pyc
+index ee26074..33c6553 100644
+Binary files a/src/__pycache__/trace.cpython-311.pyc and b/src/__pycache__/trace.cpython-311.pyc differ
+diff --git a/src/__pycache__/validation.cpython-311.pyc b/src/__pycache__/validation.cpython-311.pyc
+index f7763ec..ae9585d 100644
+Binary files a/src/__pycache__/validation.cpython-311.pyc and b/src/__pycache__/validation.cpython-311.pyc differ
+diff --git a/src/agent_state.py b/src/agent_state.py
+index db1cbf3..c679d56 100644
+--- a/src/agent_state.py
++++ b/src/agent_state.py
+@@ -3,7 +3,7 @@ from typing import List
+ from time import perf_counter
+ from uuid import uuid4
+ 
+-from .schemas import ChangedFile, FileContext, ReviewIssue
++from .schemas import ChangedFile, ContextBudget, FileContext, ReviewIssue
+ 
+ @dataclass
+ class ReviewState:
+@@ -11,8 +11,7 @@ class ReviewState:
+     repo_root:str
+     output_format:str
+     use_llm:bool
+-    max_context_chars:int
+-    max_extra_context_files:int=3
++    context_budget:ContextBudget
+     llm_provider:str="mock"
+ 
+     diff_text:str=""
+diff --git a/src/cli.py b/src/cli.py
+index 93398b2..7e1cc01 100644
+--- a/src/cli.py
++++ b/src/cli.py
+@@ -14,12 +14,14 @@ from dataclasses import asdict
+ from time import perf_counter
+ 
+ from .reporter import render_json_report, render_markdown_report
++from .schemas import ContextBudget
+ 
+ from .reviewers import review_changed_files
+ from .diff_parser import parse_diff
+ from .file_context import collect_file_contexts
+ from .llm_reviewer import review_with_llm
+ from .llm_client import get_call_model, LLMClientError
++from .validation import validate_issue_locations
+ 
+ 
+ def parse_args():
+@@ -28,10 +30,12 @@ def parse_args():
+     parser.add_argument("--diff", required=True, help="Path to git diff file")
+     parser.add_argument("--repo", default=".", help="Path to the repository root")
+     parser.add_argument(
++        "--max-prompt-chars",
+         "--max-context-chars",
++        dest="max_prompt_chars",
+         type=int,
+         default=4000,
+-        help="Maximum number of characters to read from each file for context",
++        help="Maximum characters in the complete prompt sent to the LLM",
+     )
+     parser.add_argument(
+         "--format",
+@@ -59,7 +63,7 @@ def parse_args():
+ 
+     parser.add_argument(
+         "--mock-fixture",
+-        choices=["normal", "bad_json", "timeout", "empty"],
++        choices=["normal", "bad_json", "timeout", "timeout_then_success", "empty"],
+         default="normal",
+         help="Mock LLM response fixture to use when --llm-provider=mock",
+     )
+@@ -86,9 +90,9 @@ def parse_args():
+     # 检查参数合法性
+     args = parser.parse_args()
+     
+-    # 检查 max_context_chars 是否大于0
+-    if args.max_context_chars <= 0:
+-        parser.error("--max-context-chars must be greater than 0")
++    # 检查 max_prompt_chars 是否大于0
++    if args.max_prompt_chars <= 0:
++        parser.error("--max-prompt-chars must be greater than 0")
+ 
+     if args.max_extra_context_files < 0:
+         parser.error("--max-extra-context-files must be greater than or equal to 0")
+@@ -150,10 +154,10 @@ def record_step(state, step, detail=None):
+         "detail":detail or {},
+     })
+ 
+-def validate_issues(issues):
++def validate_issues(issues, changed_files):
+     if not isinstance(issues, list):
+         raise ValueError("Issues should be a list")
+-    return issues
++    return validate_issue_locations(issues, changed_files)
+ 
+ def mock_call_model(prompt):
+     return """
+@@ -176,16 +180,26 @@ def run_review_agent(args):
+     from .agent_state import ReviewState
+     from .trace import save_trace
+ 
++    context_budget = getattr(args, "context_budget", None)
++    if context_budget is None:
++        context_budget = ContextBudget(
++            max_prompt_chars=getattr(
++                args,
++                "max_prompt_chars",
++                getattr(args, "max_context_chars", 4000),
++            ),
++            max_extra_context_files=args.max_extra_context_files,
++        )
++
+     state = ReviewState(
+         diff_path=args.diff,
+         repo_root=args.repo,
+         output_format=args.format,
+         use_llm=args.llm,
+-        max_context_chars=args.max_context_chars,
++        context_budget=context_budget,
+         llm_provider=args.llm_provider,
+         trace_enabled=args.trace,
+         trace_dir=args.trace_dir,
+-        max_extra_context_files=args.max_extra_context_files,
+     )
+ 
+     # 首先记录接收到的任务参数
+@@ -211,11 +225,22 @@ def run_review_agent(args):
+     state.contexts = collect_file_contexts(
+         repo_root=state.repo_root,
+         changed_files=state.changed_files,
+-        max_chars=state.max_context_chars,
+-        max_extra_files=args.max_extra_context_files,
++        context_budget=state.context_budget,
+     )
+     record_step(state, "collect_context",{
+         "contexts":len(state.contexts),
++        "selected_contexts":[
++            {
++                "path":context.path,
++                "source":context.source,
++                "selection_reason":context.selection_reason,
++                "exists":context.exists,
++                "truncated":context.truncated,
++                "chars_read":context.chars_read,
++                "error":context.error,
++            }
++            for context in state.contexts
++        ],
+     })
+ 
+     # 根据规则检查 changed_files，得到 rule_issues
+@@ -237,6 +262,7 @@ def run_review_agent(args):
+                 contexts=state.contexts,
+                 rule_issues=state.rule_issues,
+                 call_model=call_model,
++                max_prompt_chars=state.context_budget.max_prompt_chars,
+             )
+             state.errors.extend(validation.errors)
+             state.issues.extend(state.llm_issues)
+@@ -262,7 +288,7 @@ def run_review_agent(args):
+             "called":False,
+         })
+ 
+-    state.issues = validate_issues(state.issues)
++    state.issues = validate_issues(state.issues, state.changed_files)
+     record_step(state, "validate_output",{
+         "findings":len(state.issues),
+     })
+diff --git a/src/diff_parser.py b/src/diff_parser.py
+index 9251a61..5dadb5c 100644
+--- a/src/diff_parser.py
++++ b/src/diff_parser.py
+@@ -22,7 +22,7 @@ ChangedFile:
+ import re
+ import shlex
+ 
+-from .schemas import ChangedFile, DiffLine
++from .schemas import ChangedFile, DiffHunk, DiffLine
+ 
+ 
+ def _parse_git_path(value, prefix=None):
+@@ -62,7 +62,7 @@ def _parse_diff_git_paths(line):
+ 
+ 
+ def _build_changed_file(
+-    path, added_lines, deleted_lines, patch_lines, old_path, is_rename
++    path, added_lines, deleted_lines, patch_lines, old_path, is_rename, hunks
+ ):
+     return ChangedFile(
+         path=path,
+@@ -71,6 +71,7 @@ def _build_changed_file(
+         patch="\n".join(patch_lines),
+         old_path=old_path if is_rename else None,
+         is_rename=is_rename,
++        hunks=hunks,
+     )
+ 
+ 
+@@ -81,6 +82,7 @@ def parse_diff(diff_text: str):
+     current_is_rename = False
+     current_added_lines = []
+     current_deleted_lines = []
++    current_hunks = []
+     current_patch_lines = []
+     current_old_line = None
+     current_new_line = None
+@@ -96,6 +98,7 @@ def parse_diff(diff_text: str):
+                         current_patch_lines,
+                         current_old_path,
+                         current_is_rename,
++                        current_hunks,
+                     )
+                 )
+ 
+@@ -103,6 +106,7 @@ def parse_diff(diff_text: str):
+             current_is_rename = False
+             current_added_lines = []
+             current_deleted_lines = []
++            current_hunks = []
+             current_patch_lines = [line]
+             current_old_line = None
+             current_new_line = None
+@@ -122,10 +126,19 @@ def parse_diff(diff_text: str):
+             if new_path != "/dev/null":
+                 current_file = new_path
+         elif line.startswith("@@"):
+-            match = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
++            match = re.search(
++                r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line
++            )
+             if match:
+                 current_old_line = int(match.group(1))
+-                current_new_line = int(match.group(2))
++                current_new_line = int(match.group(3))
++                new_line_count = int(match.group(4) or 1)
++                current_hunks.append(
++                    DiffHunk(
++                        start_line=current_new_line,
++                        end_line=current_new_line + new_line_count - 1,
++                    )
++                )
+         elif line.startswith("+") and not line.startswith("+++"):
+             # A malformed diff can contain a line outside a hunk. Keep its raw
+             # patch text but do not invent a line number for review findings.
+@@ -163,6 +176,7 @@ def parse_diff(diff_text: str):
+                 current_patch_lines,
+                 current_old_path,
+                 current_is_rename,
++                current_hunks,
+             )
+         )
+ 
+diff --git a/src/eval_runner.py b/src/eval_runner.py
+index 9c5d944..ab7e7d2 100644
+--- a/src/eval_runner.py
++++ b/src/eval_runner.py
+@@ -15,6 +15,7 @@ from types import SimpleNamespace
+ from time import perf_counter
+ 
+ from .cli import run_review_agent
++from .schemas import ContextBudget
+ 
+ def load_expected(case_dir: Path):
+     expected_path = case_dir / "expected.json"
+@@ -33,20 +34,23 @@ def run_one_case(
+         repo_root: Path,
+         use_llm: bool = False,
+         llm_provider: str = "mock",
++        context_budget: ContextBudget | None = None,
+         ):
+     expected = load_expected(case_dir)
++    context_budget = context_budget or ContextBudget()
+ 
+     args=SimpleNamespace(
+         diff=str(case_dir / "input.diff"),
+         repo=str(repo_root),
+-        max_context_chars=4000,
++        max_prompt_chars=context_budget.max_prompt_chars,
+         format="json",
+         output=None,
+         llm=use_llm,
+         llm_provider=llm_provider,
+         trace=False,
+         trace_dir="traces",
+-        max_extra_context_files=3,
++        max_extra_context_files=context_budget.max_extra_context_files,
++        context_budget=context_budget,
+     )
+ 
+     started=perf_counter()
+diff --git a/src/file_context.py b/src/file_context.py
+index 82328d2..1bf3f68 100644
+--- a/src/file_context.py
++++ b/src/file_context.py
+@@ -3,26 +3,226 @@
+ 比如说120行变了，找到前后20行，100-140
+ 然后把上下文挂到 changed_file.hunks.context_lines 里面
+ 
+-后面可以实现函数边界和class边界，使用tree-sitter来解析python文件，找到函数和类的边界，然后把上下文挂到 changed_file.hunks.context_lines 里面
++Python 文件可以使用标准库 ast 定位变更行所属的函数、方法或类。
+ '''
++import ast
+ import re
+ 
+ from pathlib import Path
+-from .schemas import FileContext
++from .schemas import ContextBudget, DiffHunk, FileContext, PythonSymbol
+ 
+ IGNORED_DIRS={".git", "__pycache__", ".venv", "venv", "node_modules", "traces"}
++SENSITIVE_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
++SENSITIVE_FILE_SUFFIXES = {".pem", ".key", ".crt", ".cer", ".der", ".p12", ".pfx"}
++SENSITIVE_CONFIG_SUFFIXES = {".yaml", ".yml", ".json"}
+ 
+-def _error_context(file_path,message):
++
++def locate_python_symbol(source, line_no):
++    """Return the innermost Python symbol containing ``line_no``.
++
++    Invalid Python and lines outside a symbol deliberately return ``None`` so
++    callers can fall back to their existing file-level context.
++    """
++    if line_no < 1:
++        return None
++
++    try:
++        tree = ast.parse(source)
++    except (SyntaxError, ValueError):
++        return None
++
++    source_lines = source.splitlines(keepends=True)
++    symbols = []
++
++    def visit(node, parents=(), class_names=()):
++        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
++            decorator_lines = [decorator.lineno for decorator in node.decorator_list]
++            start_line = min([node.lineno, *decorator_lines])
++            end_line = node.end_lineno or node.lineno
++            parent = parents[-1] if parents else None
++
++            if isinstance(node, ast.ClassDef):
++                kind = "class"
++                next_class_names = (*class_names, node.name)
++            else:
++                kind = "method" if isinstance(parent, ast.ClassDef) else "function"
++                next_class_names = class_names
++
++            symbol_names = [parent_node.name for parent_node in parents]
++            qualified_name = ".".join([*symbol_names, node.name])
++            symbols.append(
++                PythonSymbol(
++                    name=node.name,
++                    kind=kind,
++                    start_line=start_line,
++                    end_line=end_line,
++                    source="".join(source_lines[start_line - 1:end_line]),
++                    qualified_name=qualified_name,
++                    class_name=".".join(class_names) or None,
++                )
++            )
++            parents = (*parents, node)
++            class_names = next_class_names
++
++        for child in ast.iter_child_nodes(node):
++            visit(child, parents, class_names)
++
++    visit(tree)
++
++    containing_symbols = [
++        symbol
++        for symbol in symbols
++        if symbol.start_line <= line_no <= symbol.end_line
++    ]
++    if not containing_symbols:
++        return None
++
++    return min(
++        containing_symbols,
++        key=lambda symbol: (symbol.end_line - symbol.start_line, -symbol.start_line),
++    )
++
++def _error_context(file_path, message, source="", selection_reason=""):
+     return FileContext(
+         path=file_path,
+         exists=False,
+         content="",
+         truncated=False,
+         chars_read=0,
+-        error=message
++        error=message,
++        source=source,
++        selection_reason=selection_reason,
++    )
++
++
++def _is_sensitive_file_path(file_path):
++    path = Path(file_path)
++    filename = path.name.lower()
++    suffix = path.suffix.lower()
++    stem = path.stem.lower()
++    parent_parts = {part.lower() for part in path.parts[:-1]}
++    is_sensitive_config = (
++        suffix in SENSITIVE_CONFIG_SUFFIXES
++        and (
++            filename == "settings.json"
++            or "config" in parent_parts
++            or ("deploy" in parent_parts and stem == "values")
++        )
++    )
++    return (
++        filename in SENSITIVE_FILE_NAMES
++        or filename.startswith(".env.")
++        or suffix in SENSITIVE_FILE_SUFFIXES
++        or is_sensitive_config
+     )
+ 
+-def read_file_context(repo_root, file_path, max_chars=4000):
++def _truncate_to_changed_lines(content, changed_line_nos, max_chars):
++    if len(content) <= max_chars:
++        return content, False
++
++    valid_line_nos = sorted({
++        line_no
++        for line_no in changed_line_nos or []
++        if isinstance(line_no, int) and line_no > 0
++    })
++    if not valid_line_nos:
++        return content[:max_chars], True
++
++    lines = content.splitlines(keepends=True)
++    selected = []
++    remaining_chars = max_chars
++
++    for line_no in valid_line_nos:
++        if line_no > len(lines) or remaining_chars == 0:
++            continue
++        line = lines[line_no - 1]
++        selected.append(line[:remaining_chars])
++        remaining_chars -= len(selected[-1])
++
++    if selected:
++        return "".join(selected), True
++
++    return content[:max_chars], True
++
++
++def _normalize_hunks(changed_hunks):
++    """Return valid, ordered new-file hunk ranges without merging them."""
++    normalized = []
++    for hunk in changed_hunks or []:
++        if isinstance(hunk, DiffHunk):
++            start_line, end_line = hunk.start_line, hunk.end_line
++        elif isinstance(hunk, (tuple, list)) and len(hunk) == 2:
++            start_line, end_line = hunk
++        else:
++            continue
++
++        if (
++            isinstance(start_line, int)
++            and isinstance(end_line, int)
++            and start_line > 0
++            and end_line >= start_line
++        ):
++            normalized.append((start_line, end_line))
++
++    return sorted(set(normalized))
++
++
++def _truncate_to_changed_hunks(content, changed_hunks, max_chars):
++    """Keep complete new-file hunks when possible, then a single oversized hunk.
++
++    Hunks are considered in source order and remain separate selections.  If a
++    hunk fits within the total limit but not the remaining budget, it is
++    skipped rather than partially copied.  Partial copying is only used when
++    one hunk itself exceeds the complete budget, in which case its contiguous
++    prefix is returned.  This preserves predictable hunk-level semantics.
++    """
++    if len(content) <= max_chars:
++        return content, False
++
++    hunk_ranges = _normalize_hunks(changed_hunks)
++    if not hunk_ranges:
++        return None
++
++    lines = content.splitlines(keepends=True)
++    selected = []
++    remaining_chars = max_chars
++
++    for start_line, end_line in hunk_ranges:
++        if start_line > len(lines):
++            continue
++
++        hunk_content = "".join(lines[start_line - 1:min(end_line, len(lines))])
++        if not hunk_content:
++            continue
++
++        if len(hunk_content) <= remaining_chars:
++            selected.append(hunk_content)
++            remaining_chars -= len(hunk_content)
++            continue
++
++        if len(hunk_content) > max_chars and not selected:
++            return hunk_content[:max_chars], True
++
++    if selected:
++        return "".join(selected), True
++
++    return None
++
++
++def read_file_context(
++        repo_root,
++        file_path,
++        max_chars=4000,
++        changed_line_nos=None,
++        changed_hunks=None,
++        source="",
++        selection_reason="",
++    ):
++    """Read one file context, preferring changed hunks within the limit.
++
++    ``changed_line_nos`` remains supported for callers that have not yet
++    supplied parsed hunk ranges.
++    """
+     repo_root_path = Path(repo_root).resolve()
+     target_path = (repo_root_path / file_path).resolve()
+ 
+@@ -32,29 +232,72 @@ def read_file_context(repo_root, file_path, max_chars=4000):
+     except ValueError:
+         return _error_context(
+             file_path,
+-            f"File {file_path} is outside of the repository root {repo_root}"
++            f"File {file_path} is outside of the repository root {repo_root}",
++            source=source,
++            selection_reason=selection_reason,
++        )
++
++    if _is_sensitive_file_path(file_path):
++        return _error_context(
++            file_path,
++            f"File {file_path} is sensitive and was not read",
++            source=source,
++            selection_reason=selection_reason,
+         )
+     
+     # 如果文件不存在，返回错误
+     if not target_path.exists():
+-        return _error_context(file_path, f"File {file_path} does not exist")
++        return _error_context(
++            file_path,
++            f"File {file_path} does not exist",
++            source=source,
++            selection_reason=selection_reason,
++        )
+     
+     # 如果是目录，返回错误
+     if target_path.is_dir():
+-        return _error_context(file_path, f"File {file_path} is a directory")
++        return _error_context(
++            file_path,
++            f"File {file_path} is a directory",
++            source=source,
++            selection_reason=selection_reason,
++        )
+     
+     # 读取文件内容，如果文件过大，只读取前max_chars个字符
+     try:
+         with target_path.open("r", encoding="utf-8") as f:
+-            content = f.read(max_chars + 1)
++            if (changed_line_nos or changed_hunks) and max_chars > 0:
++                full_content = f.read()
++            else:
++                full_content = f.read(max_chars + 1)
+ 
+-        truncated = len(content) > max_chars
+-        if truncated:
+-            content = content[:max_chars]
++        hunk_result = _truncate_to_changed_hunks(
++            full_content,
++            changed_hunks,
++            max_chars,
++        )
++        if hunk_result is not None:
++            content, truncated = hunk_result
++        else:
++            content, truncated = _truncate_to_changed_lines(
++                full_content,
++                changed_line_nos,
++                max_chars,
++            )
+     except UnicodeDecodeError:
+-        return _error_context(file_path, f"File {file_path} is not a valid UTF-8 text file")
++        return _error_context(
++            file_path,
++            f"File {file_path} is not a valid UTF-8 text file",
++            source=source,
++            selection_reason=selection_reason,
++        )
+     except OSError as e:
+-        return _error_context(file_path, f"Error reading file {file_path}: {str(e)}")
++        return _error_context(
++            file_path,
++            f"Error reading file {file_path}: {str(e)}",
++            source=source,
++            selection_reason=selection_reason,
++        )
+ 
+     return FileContext(
+         path=file_path,
+@@ -63,33 +306,55 @@ def read_file_context(repo_root, file_path, max_chars=4000):
+         truncated=truncated,
+         chars_read=len(content),
+         error="",
++        source=source,
++        selection_reason=selection_reason,
+     )
+ 
+ def collect_file_contexts(
+         repo_root,
+         changed_files,
+-        max_chars=4000,
+-        max_extra_files=3
++        context_budget,
+     ):
+     repo_root_path=Path(repo_root).resolve()
+ 
+     contexts = []
+     seen_paths=set()
++    # The prompt builder enforces the authoritative total budget.  This cap
++    # prevents context retrieval alone from exceeding that limit first.
++    remaining_chars=context_budget.max_prompt_chars
+ 
+-    def add_context(file_path):
++    def add_context(
++            file_path,
++            source,
++            selection_reason,
++            changed_line_nos=None,
++            changed_hunks=None,
++        ):
++        nonlocal remaining_chars
+         if file_path in seen_paths:
+-            return
++            return False
+         seen_paths.add(file_path)
+-        contexts.append(
+-            read_file_context(
+-                repo_root=repo_root,
+-                file_path=file_path,
+-                max_chars=max_chars,
+-            )
++        context = read_file_context(
++            repo_root=repo_root,
++            file_path=file_path,
++            max_chars=remaining_chars,
++            changed_line_nos=changed_line_nos,
++            changed_hunks=changed_hunks,
++            source=source,
++            selection_reason=selection_reason,
+         )
++        contexts.append(context)
++        remaining_chars -= context.chars_read
++        return True
+ 
+     for changed_file in changed_files:
+-        add_context(changed_file.path)
++        add_context(
++            changed_file.path,
++            source="changed_file",
++            selection_reason="file is changed in the pull request",
++            changed_line_nos=[line.line_no for line in changed_file.added_lines],
++            changed_hunks=changed_file.hunks,
++        )
+ 
+     extra_candidates=[]
+ 
+@@ -107,7 +372,11 @@ def collect_file_contexts(
+             
+             if candidate_path.exists():
+                 rel_path=str(candidate_path.relative_to(repo_root_path)).replace("\\","/")
+-                extra_candidates.append(rel_path)
++                extra_candidates.append((
++                    rel_path,
++                    "import_candidate",
++                    f"imported by selected context {context.path}",
++                ))
+ 
+     call_names=set()
+     changed_paths={changed_file.path for changed_file in changed_files}
+@@ -123,17 +392,31 @@ def collect_file_contexts(
+ 
+         try:
+             with py_file.open("r", encoding="utf-8", errors="ignore") as f:
+-                content=f.read(max_chars)
++                content=f.read(context_budget.max_prompt_chars)
+         except OSError:
+             continue
+             
+-        if any(re.search(rf"\bdef\s+{re.escape(name)}\b", content) for name in call_names):
+-            extra_candidates.append(rel_path)
+-
+-    for file_path in extra_candidates:
+-        if len(seen_paths)>=len(changed_files) + max_extra_files:
++        matching_call_names = sorted(
++            name
++            for name in call_names
++            if re.search(rf"\bdef\s+{re.escape(name)}\b", content)
++        )
++        if matching_call_names:
++            extra_candidates.append((
++                rel_path,
++                "call_name_candidate",
++                "defines added call name(s): " + ", ".join(matching_call_names),
++            ))
++
++    extra_context_count=0
++    for file_path, source, selection_reason in extra_candidates:
++        if (
++            extra_context_count >= context_budget.max_extra_context_files
++            or remaining_chars == 0
++        ):
+             break
+-        add_context(file_path)
++        if add_context(file_path, source, selection_reason):
++            extra_context_count += 1
+ 
+     return contexts
+ 
+diff --git a/src/llm_client.py b/src/llm_client.py
+index bd8c03e..d48f184 100644
+--- a/src/llm_client.py
++++ b/src/llm_client.py
+@@ -1,11 +1,26 @@
+ import json
+ import os
++import time
+ from functools import partial
+ 
+ 
++DEFAULT_TIMEOUT_SECONDS = 10.0
++DEFAULT_MAX_ATTEMPTS = 3
++DEFAULT_RETRY_BASE_DELAY_SECONDS = 0.25
++
++
+ class LLMClientError(RuntimeError):
+     pass
+ 
++
++class LLMRetryableError(LLMClientError):
++    """An LLM provider failure that may succeed on a later attempt."""
++
++
++class LLMConfigurationError(LLMClientError):
++    """A local configuration error that retrying cannot resolve."""
++
++
+ MOCK_RESPONSE_FIXTURES = {
+     "normal": {
+         "findings": [
+@@ -27,52 +42,122 @@ MOCK_RESPONSE_FIXTURES = {
+ 
+ def mock_call_model(prompt: str, fixture: str = "normal") -> str:
+     if fixture == "timeout":
+-        raise LLMClientError("mock_timeout")
++        raise LLMRetryableError("mock_timeout")
+     if fixture == "bad_json":
+         return "{not valid json"
+ 
+     try:
+         return json.dumps(MOCK_RESPONSE_FIXTURES[fixture], ensure_ascii=False)
+     except KeyError as exc:
+-        raise LLMClientError(f"unsupported_mock_fixture:{fixture}") from exc
++        raise LLMConfigurationError(f"unsupported_mock_fixture:{fixture}") from exc
++
++
++def make_mock_call_model(fixture: str):
++    """Build a stateful mock callable for retry-path tests and CLI smoke tests."""
++    failures_remaining = 2 if fixture == "timeout_then_success" else 0
++
++    def call_model(prompt: str) -> str:
++        nonlocal failures_remaining
++        if failures_remaining:
++            failures_remaining -= 1
++            raise LLMRetryableError("mock_timeout")
++        if fixture == "timeout_then_success":
++            return mock_call_model(prompt, fixture="normal")
++        return mock_call_model(prompt, fixture=fixture)
++
++    return call_model
++
++
++def _is_retryable_provider_error(exc: Exception) -> bool:
++    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
++        return True
++    if type(exc).__name__ in {"APITimeoutError", "APIConnectionError"}:
++        return True
+ 
+-def real_call_model(prompt:str)->str:
+-    api_key=os.getenv("OPENAI_API_KEY")
++    status_code = getattr(exc, "status_code", None)
++    return status_code == 429 or isinstance(status_code, int) and status_code >= 500
++
++
++def real_call_model(prompt: str, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> str:
++    api_key = os.getenv("OPENAI_API_KEY")
+     if not api_key:
+-        raise LLMClientError("missing_OPENAI_API_KEY")
+-    
+-    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
++        raise LLMConfigurationError("missing_OPENAI_API_KEY")
++
++    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+ 
+     try:
+         from openai import OpenAI
+-        client=OpenAI(api_key=api_key)
+-        response=client.responses.create(
++
++        client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
++        response = client.responses.create(
+             model=model,
+             input=[
+                 {
+                     "role": "system",
+-                    "content":"You are a strict code review assistant. Return JSON only.",
++                    "content": "You are a strict code review assistant. Return JSON only.",
+                 },
+                 {
+-                    "role":"user",
+-                    "content":prompt,
++                    "role": "user",
++                    "content": prompt,
+                 },
+             ],
++            timeout=timeout_seconds,
+         )
+         if not response.output_text:
+             raise LLMClientError("openai_empty_response")
+-        
++
+         return response.output_text
+-    
+     except LLMClientError:
+         raise
+     except Exception as exc:
+-        raise LLMClientError(f"openai_call_failed:{exc}") from exc
+-    
+-def get_call_model(provider: str, *, mock_fixture: str = "normal"):
++        error_type = LLMRetryableError if _is_retryable_provider_error(exc) else LLMClientError
++        raise error_type(f"openai_call_failed:{exc}") from exc
++
++
++def call_with_retries(
++    call_model,
++    prompt: str,
++    *,
++    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
++    retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS,
++    sleep=time.sleep,
++) -> str:
++    if max_attempts < 1:
++        raise ValueError("max_attempts must be at least 1")
++    if retry_base_delay_seconds < 0:
++        raise ValueError("retry_base_delay_seconds must be non-negative")
++
++    for attempt in range(max_attempts):
++        try:
++            return call_model(prompt)
++        except LLMRetryableError:
++            if attempt == max_attempts - 1:
++                raise
++            sleep(retry_base_delay_seconds * (2**attempt))
++
++    raise RuntimeError("unreachable")
++
++
++def get_call_model(
++    provider: str,
++    *,
++    mock_fixture: str = "normal",
++    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
++    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
++    retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS,
++    sleep=time.sleep,
++):
+     if provider == "mock":
+-        return partial(mock_call_model, fixture=mock_fixture)
+-    if provider=="openai":
+-        return real_call_model
+-    
+-    raise LLMClientError(f"unsupported_llm_provider:{provider}")
++        call_model = make_mock_call_model(mock_fixture)
++    elif provider == "openai":
++        call_model = partial(real_call_model, timeout_seconds=timeout_seconds)
++    else:
++        raise LLMConfigurationError(f"unsupported_llm_provider:{provider}")
++
++    return partial(
++        call_with_retries,
++        call_model,
++        max_attempts=max_attempts,
++        retry_base_delay_seconds=retry_base_delay_seconds,
++        sleep=sleep,
++    )
+diff --git a/src/llm_reviewer.py b/src/llm_reviewer.py
+index d5286c9..d2e1541 100644
+--- a/src/llm_reviewer.py
++++ b/src/llm_reviewer.py
+@@ -1,24 +1,70 @@
+ import json
+ from dataclasses import asdict
+ 
+-from .schemas import ReviewIssue
++from .file_context import _is_sensitive_file_path
++from .schemas import ContextBudget, ReviewIssue
+ from .validation import validate_llm_response
+ 
+-def build_llm_prompt(changed_files, contexts, rule_issues):
++_TRUNCATION_MARKER = "\n[TRUNCATED: prompt budget reached]\n"
++_REDACTED_DIFF_PLACEHOLDER = "[REDACTED: sensitive file diff suppressed]"
++
++
++def _apply_prompt_budget(prompt, max_prompt_chars):
++    """Return a deterministic, visibly truncated prompt within its limit."""
++    if max_prompt_chars <= 0:
++        raise ValueError("max_prompt_chars must be greater than 0")
++    if len(prompt) <= max_prompt_chars:
++        return prompt
++
++    # Very small budgets cannot hold the full marker.  The ellipsis remains a
++    # visible truncation indicator while preserving the hard length contract.
++    if max_prompt_chars < len(_TRUNCATION_MARKER):
++        return "…"[:max_prompt_chars]
++    return prompt[:max_prompt_chars - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
++
++
++def _sanitize_changed_file_for_prompt(changed_file):
++    # Diffs arrive from git and bypass read_file_context, so redact sensitive paths here.
++    if _is_sensitive_file_path(changed_file.path):
++        return {
++            "path": changed_file.path,
++            "patch": _REDACTED_DIFF_PLACEHOLDER,
++            "added_lines": [],
++            "deleted_lines": [],
++        }
++    return {
++        "path": changed_file.path,
++        "patch": changed_file.patch,
++        "added_lines": [asdict(line) for line in changed_file.added_lines],
++        "deleted_lines": [asdict(line) for line in changed_file.deleted_lines],
++    }
++
++
++def build_llm_prompt(
++        changed_files,
++        contexts,
++        rule_issues,
++        max_prompt_chars=None,
++    ):
++    """Build the complete LLM input and enforce its character budget.
++
++    Render order is intentional: fixed instructions come first, followed by
++    patches and changed lines, file contexts, and rule findings.  If the
++    limit is reached, the explicit marker shows that trailing input was
++    omitted.  The returned string is the authoritative budgeted artifact.
++    """
++    if max_prompt_chars is None:
++        max_prompt_chars = ContextBudget().max_prompt_chars
++
+     payload={
+         "changed_files":[
+-            {
+-                "path":changed_file.path,
+-                "patch":changed_file.patch,
+-                "added_lines":[asdict(line) for line in changed_file.added_lines],
+-                "deleted_lines":[asdict(line) for line in changed_file.deleted_lines],
+-            }
++            _sanitize_changed_file_for_prompt(changed_file)
+             for changed_file in changed_files
+         ],
+         "contexts":[asdict(context) for context in contexts],
+         "rule_findings":[asdict(issue) for issue in rule_issues],
+     }
+-    return f"""
++    prompt = f"""
+ 你是一个严谨的代码审查助手。
+ 
+ 请根据 git diff、文件上下文和已有规则检查结果，继续发现更深层的问题。
+@@ -52,6 +98,10 @@ source 字段由系统根据调用路径赋值；不要在 JSON 中输出 source
+ 输入如下：
+ {json.dumps(payload, ensure_ascii=False, indent=2)}
+ """.strip()
++    prompt = _apply_prompt_budget(prompt, max_prompt_chars)
++    if len(prompt) > max_prompt_chars:
++        raise RuntimeError("LLM prompt exceeded max_prompt_chars")
++    return prompt
+ 
+ def _severity_from_llm(severity):
+     mapping = {
+@@ -82,11 +132,18 @@ def parse_llm_response(response_text):
+         )
+     return issues, validation
+ 
+-def review_with_llm(changed_files, contexts, rule_issues, call_model):
++def review_with_llm(
++        changed_files,
++        contexts,
++        rule_issues,
++        call_model,
++        max_prompt_chars=None,
++    ):
+     prompt=build_llm_prompt(
+         changed_files=changed_files,
+         contexts=contexts,
+-        rule_issues=rule_issues
++        rule_issues=rule_issues,
++        max_prompt_chars=max_prompt_chars,
+     )
+     
+     response_text=call_model(prompt)
+diff --git a/src/schemas.py b/src/schemas.py
+index 46d7302..98a3185 100644
+--- a/src/schemas.py
++++ b/src/schemas.py
+@@ -4,7 +4,7 @@
+ 让模块之间传递的数据有统一的格式
+ '''
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import List, Optional
+ 
+ @dataclass
+@@ -13,6 +13,16 @@ class DiffLine:
+     line_no:int
+     content:str
+ 
++@dataclass(frozen=True)
++class DiffHunk:
++    """A range of lines in the new version of a file described by one hunk.
++
++    ``end_line`` is inclusive.  A zero-length new-file hunk is represented by
++    ``end_line == start_line - 1``.
++    """
++    start_line:int
++    end_line:int
++
+ @dataclass
+ class ChangedFile:
+     path:str
+@@ -21,6 +31,7 @@ class ChangedFile:
+     patch:str
+     old_path:Optional[str]=None
+     is_rename:bool=False
++    hunks:List[DiffHunk]=field(default_factory=list)
+ 
+ @dataclass
+ class ReviewIssue:
+@@ -57,6 +68,57 @@ class FileContext:
+     truncated: bool
+     chars_read:int
+     error:str=""
++    source:str=""
++    selection_reason:str=""
++
++@dataclass
++class PythonSymbol:
++    '''A Python class, function, or method located from a source line.'''
++    name:str
++    kind:str
++    start_line:int
++    end_line:int
++    source:str
++    qualified_name:str
++    class_name:Optional[str]=None
++
++@dataclass(frozen=True, init=False)
++class ContextBudget:
++    '''Limits the complete prompt sent to the LLM for one review run.
++
++    File-context retrieval uses this value as an upper bound, but only the
++    fully serialized prompt is authoritative.  ``max_context_chars`` is kept
++    as a read-only compatibility alias for callers using the former name.
++    '''
++    max_prompt_chars:int
++    max_extra_context_files:int
++
++    def __init__(
++            self,
++            max_prompt_chars=4000,
++            max_extra_context_files=3,
++            *,
++            max_context_chars=None,
++        ):
++        if max_context_chars is not None:
++            if max_prompt_chars != 4000 and max_prompt_chars != max_context_chars:
++                raise ValueError(
++                    "max_prompt_chars and max_context_chars must match when both are set"
++                )
++            max_prompt_chars = max_context_chars
++
++        if max_prompt_chars <= 0:
++            raise ValueError("max_prompt_chars must be greater than 0")
++        if max_extra_context_files < 0:
++            raise ValueError("max_extra_context_files must be greater than or equal to 0")
++
++        object.__setattr__(self, "max_prompt_chars", max_prompt_chars)
++        object.__setattr__(self, "max_extra_context_files", max_extra_context_files)
++
++    @property
++    def max_context_chars(self):
++        '''Compatibility alias; use ``max_prompt_chars`` for new code.'''
++        return self.max_prompt_chars
+ 
+ @dataclass
+ class LLMReviewResult:
+diff --git a/src/trace.py b/src/trace.py
+index 026ee33..c14f764 100644
+--- a/src/trace.py
++++ b/src/trace.py
+@@ -56,6 +56,8 @@ def save_trace(state, trace_dir="traces"):
+                 "chars_read":context.chars_read,
+                 "truncated":context.truncated,
+                 "error":context.error,
++                "source":context.source,
++                "selection_reason":context.selection_reason,
+             }
+             for context in state.contexts
+         ],
+diff --git a/src/validation.py b/src/validation.py
+index 0d9e998..03a6cbd 100644
+--- a/src/validation.py
++++ b/src/validation.py
+@@ -12,6 +12,44 @@ class ValidationResult:
+     repaired: bool=False
+     errors: list[str]=field(default_factory=list)
+ 
++
++def validate_issue_locations(issues, changed_files):
++    """Keep only findings that can be published against changed hunks.
++
++    Repository-level rule findings are intentionally retained because they are
++    not inline findings and are produced by trusted deterministic rules.
++    """
++    hunks_by_path = {}
++    for changed_file in changed_files:
++        hunks_by_path.setdefault(changed_file.path, []).extend(changed_file.hunks)
++
++    validated_issues = []
++    for issue in issues:
++        if (
++            getattr(issue, "source", None) == "rule"
++            and getattr(issue, "file_path", None) == "(repository)"
++            and getattr(issue, "line_no", None) == 0
++        ):
++            validated_issues.append(issue)
++            continue
++
++        file_path = getattr(issue, "file_path", None)
++        line_no = getattr(issue, "line_no", None)
++        if (
++            not isinstance(file_path, str)
++            or isinstance(line_no, bool)
++            or not isinstance(line_no, int)
++        ):
++            continue
++
++        if any(
++            hunk.start_line <= line_no <= hunk.end_line
++            for hunk in hunks_by_path.get(file_path, [])
++        ):
++            validated_issues.append(issue)
++
++    return validated_issues
++
+ def validate_llm_response(response_text: str) -> ValidationResult:
+     result = ValidationResult()
+ 
+diff --git a/tests/__pycache__/test_cli_smoke.cpython-311-pytest-7.4.0.pyc b/tests/__pycache__/test_cli_smoke.cpython-311-pytest-7.4.0.pyc
+index 95b97dd..8be20c0 100644
+Binary files a/tests/__pycache__/test_cli_smoke.cpython-311-pytest-7.4.0.pyc and b/tests/__pycache__/test_cli_smoke.cpython-311-pytest-7.4.0.pyc differ
+diff --git a/tests/__pycache__/test_diff_parser.cpython-311-pytest-7.4.0.pyc b/tests/__pycache__/test_diff_parser.cpython-311-pytest-7.4.0.pyc
+index d2c0efe..1b16153 100644
+Binary files a/tests/__pycache__/test_diff_parser.cpython-311-pytest-7.4.0.pyc and b/tests/__pycache__/test_diff_parser.cpython-311-pytest-7.4.0.pyc differ
+diff --git a/tests/__pycache__/test_eval_runner.cpython-311-pytest-7.4.0.pyc b/tests/__pycache__/test_eval_runner.cpython-311-pytest-7.4.0.pyc
+index 216ea33..b5e55f0 100644
+Binary files a/tests/__pycache__/test_eval_runner.cpython-311-pytest-7.4.0.pyc and b/tests/__pycache__/test_eval_runner.cpython-311-pytest-7.4.0.pyc differ
+diff --git a/tests/__pycache__/test_file_context.cpython-311-pytest-7.4.0.pyc b/tests/__pycache__/test_file_context.cpython-311-pytest-7.4.0.pyc
+index ee0763f..1da1c0d 100644
+Binary files a/tests/__pycache__/test_file_context.cpython-311-pytest-7.4.0.pyc and b/tests/__pycache__/test_file_context.cpython-311-pytest-7.4.0.pyc differ
+diff --git a/tests/__pycache__/test_validation.cpython-311-pytest-7.4.0.pyc b/tests/__pycache__/test_validation.cpython-311-pytest-7.4.0.pyc
+index 6a4e299..ed712bc 100644
+Binary files a/tests/__pycache__/test_validation.cpython-311-pytest-7.4.0.pyc and b/tests/__pycache__/test_validation.cpython-311-pytest-7.4.0.pyc differ
+diff --git a/tests/test_cli_smoke.py b/tests/test_cli_smoke.py
+index c6a5342..709e1e7 100644
+--- a/tests/test_cli_smoke.py
++++ b/tests/test_cli_smoke.py
+@@ -1,4 +1,5 @@
+ import json
++import sys
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -60,14 +61,18 @@ def test_cli_mock_llm_metadata_reaches_json_and_markdown(tmp_path):
+     repo.mkdir()
+ 
+     app_file = repo / "app.py"
+-    app_file.write_text("def run():\n    return 1\n", encoding="utf-8")
++    app_file.write_text(
++        "".join(f"existing_{line_no} = {line_no}\n" for line_no in range(1, 10))
++        + "def run():\n    return 1\n",
++        encoding="utf-8",
++    )
+ 
+     diff_file = tmp_path / "input.diff"
+     diff_file.write_text(
+         """diff --git a/app.py b/app.py
+ --- a/app.py
+ +++ b/app.py
+-@@ -0,0 +1,2 @@
++@@ -9,0 +10,2 @@
+ +def run():
+ +    return 1
+ """,
+@@ -186,3 +191,193 @@ def test_cli_mock_llm_timeout_is_recorded_without_an_llm_finding(tmp_path):
+         "error": "mock_timeout",
+     }
+     assert not any(finding["source"] == "llm" for finding in findings)
++
++
++def test_cli_records_exhausted_openai_http_503_without_llm_finding(
++    tmp_path, monkeypatch
++):
++    request_arguments = []
++
++    class ProviderUnavailable(Exception):
++        status_code = 503
++
++    class FakeResponses:
++        def create(self, **kwargs):
++            request_arguments.append(kwargs)
++            raise ProviderUnavailable("service unavailable")
++
++    class FakeOpenAI:
++        def __init__(self, **_kwargs):
++            self.responses = FakeResponses()
++
++    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
++    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
++    args = make_llm_fixture_args(tmp_path, "normal")
++    args.llm_provider = "openai"
++
++    output, trace_steps = run_review_agent(args)
++
++    llm_step = next(step for step in trace_steps if step["step"] == "run_llm_review")
++    findings = json.loads(output)["findings"]
++
++    assert len(request_arguments) == 3
++    assert llm_step["detail"]["findings"] == 0
++    assert llm_step["detail"]["error"] == "openai_call_failed:service unavailable"
++    assert not any(finding["source"] == "llm" for finding in findings)
++
++
++def test_cli_retries_mock_timeout_then_publishes_recovered_llm_finding(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text(
++        "".join(f"existing_{line_no} = {line_no}\n" for line_no in range(1, 10))
++        + "def run():\n    return 1\n",
++        encoding="utf-8",
++    )
++    diff_file = tmp_path / "input.diff"
++    diff_file.write_text(
++        """diff --git a/app.py b/app.py
++--- a/app.py
+++++ b/app.py
++@@ -9,0 +10,2 @@
+++def run():
+++    return 1
++""",
++        encoding="utf-8",
++    )
++    args = SimpleNamespace(
++        diff=str(diff_file),
++        repo=str(repo),
++        max_context_chars=4000,
++        format="json",
++        output=None,
++        llm=True,
++        llm_provider="mock",
++        mock_fixture="timeout_then_success",
++        trace=False,
++        trace_dir=str(tmp_path / "traces"),
++        max_extra_context_files=0,
++    )
++
++    output, trace_steps = run_review_agent(args)
++
++    llm_step = next(step for step in trace_steps if step["step"] == "run_llm_review")
++    findings = json.loads(output)["findings"]
++
++    assert llm_step["detail"]["valid"] is True
++    assert any(finding["source"] == "llm" for finding in findings)
++
++
++def test_cli_does_not_publish_llm_findings_outside_changed_hunks(tmp_path, monkeypatch):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text("new_value = 1\n", encoding="utf-8")
++    diff_file = tmp_path / "input.diff"
++    diff_file.write_text(
++        """diff --git a/app.py b/app.py
++--- a/app.py
+++++ b/app.py
++@@ -0,0 +1,1 @@
+++new_value = 1
++""",
++        encoding="utf-8",
++    )
++    response = {
++        "findings": [
++            {
++                "severity": "low",
++                "file": "app.py",
++                "line": 1,
++                "issue": "valid",
++                "reason": "inside hunk",
++                "suggested_fix": "fix it",
++                "confidence": 0.9,
++                "evidence": "app.py:1",
++            },
++            {
++                "severity": "low",
++                "file": "app.py",
++                "line": 2,
++                "issue": "wrong line",
++                "reason": "outside hunk",
++                "suggested_fix": "fix it",
++                "confidence": 0.9,
++                "evidence": "app.py:2",
++            },
++            {
++                "severity": "low",
++                "file": "other.py",
++                "line": 1,
++                "issue": "wrong file",
++                "reason": "outside scope",
++                "suggested_fix": "fix it",
++                "confidence": 0.9,
++                "evidence": "other.py:1",
++            },
++        ]
++    }
++    monkeypatch.setattr(
++        "src.cli.get_call_model",
++        lambda *_args, **_kwargs: lambda _prompt: json.dumps(response),
++    )
++    args = SimpleNamespace(
++        diff=str(diff_file),
++        repo=str(repo),
++        max_context_chars=4000,
++        format="json",
++        output=None,
++        llm=True,
++        llm_provider="mock",
++        trace=False,
++        trace_dir=str(tmp_path / "traces"),
++        max_extra_context_files=0,
++    )
++
++    output, trace_steps = run_review_agent(args)
++
++    findings = json.loads(output)["findings"]
++    assert [finding["issue"] for finding in findings if finding["source"] == "llm"] == ["valid"]
++    validate_step = next(step for step in trace_steps if step["step"] == "validate_output")
++    assert validate_step["detail"]["findings"] == len(findings)
++
++
++def test_cli_trace_records_context_provenance(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text("def run():\n    return True\n", encoding="utf-8")
++    diff_file = tmp_path / "input.diff"
++    diff_file.write_text(
++        """diff --git a/app.py b/app.py
++--- a/app.py
+++++ b/app.py
++@@ -0,0 +1,2 @@
+++def run():
+++    return True
++""",
++        encoding="utf-8",
++    )
++    args = SimpleNamespace(
++        diff=str(diff_file),
++        repo=str(repo),
++        max_context_chars=4000,
++        format="json",
++        output=None,
++        llm=False,
++        llm_provider="mock",
++        trace=True,
++        trace_dir=str(tmp_path / "traces"),
++        max_extra_context_files=0,
++    )
++
++    _, trace_steps = run_review_agent(args)
++
++    collect_step = next(step for step in trace_steps if step["step"] == "collect_context")
++    selected_context = collect_step["detail"]["selected_contexts"][0]
++    assert selected_context["source"] == "changed_file"
++    assert selected_context["selection_reason"] == "file is changed in the pull request"
++
++    trace_paths = list((tmp_path / "traces").glob("*.json"))
++    assert len(trace_paths) == 1
++    saved_context = json.loads(trace_paths[0].read_text(encoding="utf-8"))["context_files"][0]
++    assert saved_context["source"] == "changed_file"
++    assert saved_context["selection_reason"] == "file is changed in the pull request"
+diff --git a/tests/test_diff_parser.py b/tests/test_diff_parser.py
+index f51b028..1bc4405 100644
+--- a/tests/test_diff_parser.py
++++ b/tests/test_diff_parser.py
+@@ -2,6 +2,7 @@ from pathlib import Path
+ 
+ from src.diff_parser import parse_diff
+ from src.file_context import collect_file_contexts
++from src.schemas import ContextBudget, DiffHunk
+ from src.reporter import render_markdown_report
+ from src.reviewers import review_changed_files
+ 
+@@ -31,6 +32,7 @@ def test_parse_added_and_deleted_lines():
+     assert len(changed.deleted_lines) == 1
+     assert changed.deleted_lines[0].line_no == 2
+     assert changed.deleted_lines[0].content == "    old_debug = True"
++    assert changed.hunks == [DiffHunk(start_line=1, end_line=3)]
+ 
+ 
+ def test_parse_pure_rename_records_old_and_new_path():
+@@ -125,6 +127,10 @@ def test_parse_new_line_numbers_across_multiple_hunks():
+         ("service.py", 3, "    first = True"),
+         ("service.py", 22, "    second = True"),
+     ]
++    assert changed.hunks == [
++        DiffHunk(start_line=2, end_line=4),
++        DiffHunk(start_line=21, end_line=23),
++    ]
+ 
+ 
+ def test_rename_and_space_path_do_not_break_downstream_consumers(tmp_path):
+@@ -144,7 +150,11 @@ rename to new name.py
+ """
+     )
+ 
+-    contexts = collect_file_contexts(repo, changed_files, max_extra_files=0)
++    contexts = collect_file_contexts(
++        repo,
++        changed_files,
++        context_budget=ContextBudget(max_extra_context_files=0),
++    )
+     issues = review_changed_files(changed_files)
+     report = render_markdown_report(issues, changed_files, contexts)
+ 
+diff --git a/tests/test_eval_runner.py b/tests/test_eval_runner.py
+index 6d6db90..1a4c61a 100644
+--- a/tests/test_eval_runner.py
++++ b/tests/test_eval_runner.py
+@@ -3,6 +3,7 @@ import json
+ import pytest
+ 
+ from src import eval_runner
++from src.schemas import ContextBudget
+ 
+ 
+ def make_case(tmp_path, *, expected_categories, should_find):
+@@ -86,6 +87,23 @@ def test_run_one_case_marks_runner_failure_as_not_passed(tmp_path, monkeypatch):
+     assert result["error"] == "review failed"
+ 
+ 
++def test_run_one_case_passes_context_budget_to_review_agent(tmp_path, monkeypatch):
++    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
++    budget = ContextBudget(max_prompt_chars=17, max_extra_context_files=0)
++
++    def fake_review(args):
++        assert args.context_budget is budget
++        assert args.max_prompt_chars == 17
++        assert args.max_extra_context_files == 0
++        return json.dumps({"findings": []}), []
++
++    monkeypatch.setattr(eval_runner, "run_review_agent", fake_review)
++
++    result = eval_runner.run_one_case(case_dir, tmp_path, context_budget=budget)
++
++    assert result["passed"] is True
++
++
+ def test_run_eval_aggregates_case_metrics(tmp_path, monkeypatch):
+     cases_dir = tmp_path / "cases"
+     cases_dir.mkdir()
+diff --git a/tests/test_file_context.py b/tests/test_file_context.py
+index 1ffc5bd..2f58cff 100644
+--- a/tests/test_file_context.py
++++ b/tests/test_file_context.py
+@@ -1,32 +1,454 @@
+-from src.file_context import read_file_context
+-
++import pytest
+ 
++from src.file_context import collect_file_contexts, locate_python_symbol, read_file_context
++from src.schemas import ChangedFile, ContextBudget, DiffHunk, DiffLine
++
++
+ def test_read_file_context_rejects_outside_repo(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++
++    outside_file = tmp_path / "secret.txt"
++    outside_file.write_text("do not read me", encoding="utf-8")
++
++    context = read_file_context(
++        repo_root=repo,
++        file_path="../secret.txt",
++        max_chars=100,
++    )
++
++    assert context.exists is False
++    assert "outside" in context.error
++
++
++@pytest.mark.parametrize(
++    "file_path",
++    [
++        ".env",
++        ".env.production",
++        ".envrc",
++        "keys/id_rsa",
++        "certificates/service.pem",
++        "certificates/service.key",
++        "certificates/service.crt",
++        "certificates/service.cer",
++        "certificates/service.pfx",
++        "config/production.yaml",
++        "CONFIG/nested/PROD.JSON",
++        "deploy/values.yaml",
++        "DEPLOY/nested/VALUES.YML",
++        "settings.json",
++    ],
++)
++def test_read_file_context_skips_sensitive_files_without_reading_content(tmp_path, file_path):
+     repo = tmp_path / "repo"
+     repo.mkdir()
++    target = repo / file_path
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_text("API_KEY=secret\n", encoding="utf-8")
+ 
+-    outside_file = tmp_path / "secret.txt"
+-    outside_file.write_text("do not read me", encoding="utf-8")
++    context = read_file_context(repo, file_path, max_chars=100)
+ 
+-    context = read_file_context(
+-        repo_root=repo,
+-        file_path="../secret.txt",
+-        max_chars=100,
+-    )
++    assert context.exists is False
++    assert context.content == ""
++    assert context.chars_read == 0
++    assert "sensitive" in context.error
++
++
++def test_read_file_context_does_not_reject_non_sensitive_filename_containing_key(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "monkey.py").write_text("value = 1\n", encoding="utf-8")
++
++    context = read_file_context(repo, "monkey.py", max_chars=100)
++
++    assert context.exists is True
++    assert context.content == "value = 1\n"
++
++
++def test_read_file_context_keeps_non_sensitive_configuration_readable(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    config = repo / "openapi.yaml"
++    config.write_text("feature_enabled: true\n", encoding="utf-8")
++
++    context = read_file_context(repo, "openapi.yaml", max_chars=100)
++
++    assert context.exists is True
++    assert context.content == "feature_enabled: true\n"
++
++
++def test_read_file_context_skips_all_config_yaml_under_config_dir(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    config = repo / "config" / "development.yaml"
++    config.parent.mkdir()
++    config.write_text("api_key: secret\n", encoding="utf-8")
++
++    context = read_file_context(repo, "config/development.yaml", max_chars=100)
+ 
+     assert context.exists is False
+-    assert "outside" in context.error
++    assert context.content == ""
++    assert context.chars_read == 0
++    assert "sensitive" in context.error
+ 
++
++def test_collect_file_contexts_preserves_sensitive_file_provenance_without_content(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
++    changed_file = ChangedFile(
++        path=".env",
++        added_lines=[DiffLine(file_path=".env", line_no=1, content="+API_KEY=secret")],
++        deleted_lines=[],
++        patch="@@ -0,0 +1,1 @@\n+API_KEY=secret\n",
++        hunks=[DiffHunk(start_line=1, end_line=1)],
++    )
++
++    contexts = collect_file_contexts(
++        repo,
++        [changed_file],
++        context_budget=ContextBudget(max_prompt_chars=100, max_extra_context_files=0),
++    )
++
++    assert len(contexts) == 1
++    context = contexts[0]
++    assert context.path == ".env"
++    assert context.exists is False
++    assert context.content == ""
++    assert context.chars_read == 0
++    assert context.source == "changed_file"
++    assert context.selection_reason == "file is changed in the pull request"
++
+ def test_read_file_context_truncates_large_file(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++
++    target = repo / "app.py"
++    target.write_text("abcdef", encoding="utf-8")
++
++    context = read_file_context(repo, "app.py", max_chars=3)
++
++    assert context.exists is True
++    assert context.content == "abc"
++    assert context.truncated is True
++    assert context.chars_read == 3
++
++
++def test_read_file_context_prioritizes_changed_lines_when_truncated(tmp_path):
+     repo = tmp_path / "repo"
+     repo.mkdir()
++    marker = "changed_marker = True\n"
++    lines = [f"header_{line_no}\n" for line_no in range(1, 301)]
++    lines[249] = marker
++    (repo / "app.py").write_text("".join(lines), encoding="utf-8")
+ 
+-    target = repo / "app.py"
+-    target.write_text("abcdef", encoding="utf-8")
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=len(marker),
++        changed_line_nos=[250],
++    )
+ 
+-    context = read_file_context(repo, "app.py", max_chars=3)
++    assert context.content == marker
++    assert "header_1" not in context.content
++    assert context.truncated is True
++    assert context.chars_read == len(marker)
+ 
+-    assert context.exists is True
+-    assert context.content == "abc"
++
++def test_read_file_context_preserves_multiple_changed_lines_when_truncated(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    markers = ["first_changed_marker\n", "second_changed_marker\n"]
++    lines = [f"header_{line_no}\n" for line_no in range(1, 301)]
++    lines[19], lines[249] = markers
++    (repo / "app.py").write_text("".join(lines), encoding="utf-8")
++
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=sum(map(len, markers)),
++        changed_line_nos=[20, 250],
++    )
++
++    assert context.content == "".join(markers)
++    assert "header_1" not in context.content
++
++
++def test_read_file_context_preserves_unchanged_lines_in_changed_hunk(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    lines = [f"header_{line_no}\n" for line_no in range(1, 301)]
++    lines[249] = "if enabled:\n"
++    lines[250] = "    return value\n"
++    (repo / "app.py").write_text("".join(lines), encoding="utf-8")
++
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=len("if enabled:\n    return value\n"),
++        changed_line_nos=[250],
++        changed_hunks=[DiffHunk(start_line=250, end_line=251)],
++    )
++
++    assert context.content == "if enabled:\n    return value\n"
++    assert context.truncated is True
++
++
++def test_read_file_context_keeps_multiple_hunks_separate(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    content = "one\nfirst_change\ntwo\nignored_between_hunks\nthree\nsecond_change\nfour\n"
++    (repo / "app.py").write_text(content, encoding="utf-8")
++
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=len("one\nfirst_change\nthree\nsecond_change\n"),
++        changed_hunks=[DiffHunk(1, 2), DiffHunk(5, 6)],
++    )
++
++    assert context.content == "one\nfirst_change\nthree\nsecond_change\n"
++    assert "ignored_between_hunks" not in context.content
++
++
++def test_read_file_context_only_partially_copies_an_oversized_hunk(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text("prefix\nif enabled:\n    return value\n", encoding="utf-8")
++
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=len("if enabled:\n"),
++        changed_hunks=[DiffHunk(2, 3)],
++    )
++
++    assert context.content == "if enabled:\n"
+     assert context.truncated is True
+-    assert context.chars_read == 3
+\ No newline at end of file
++
++
++def test_read_file_context_falls_back_to_file_start_for_missing_changed_line(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text("first_line\nsecond_line\n", encoding="utf-8")
++
++    context = read_file_context(
++        repo,
++        "app.py",
++        max_chars=5,
++        changed_line_nos=[999],
++    )
++
++    assert context.content == "first"
++    assert context.truncated is True
++
++
++def test_collect_file_contexts_enforces_total_budget_for_changed_files(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    markers = {
++        "first.py": "first_changed_marker\n",
++        "second.py": "second_changed_marker\n",
++    }
++    changed_files = []
++
++    for path, marker in markers.items():
++        lines = [f"header_{line_no}\n" for line_no in range(1, 301)]
++        lines[249] = marker
++        (repo / path).write_text("".join(lines), encoding="utf-8")
++        changed_files.append(
++            ChangedFile(
++                path=path,
++                added_lines=[DiffLine(path, 250, marker.rstrip())],
++                deleted_lines=[],
++                patch="",
++            )
++        )
++
++    budget = ContextBudget(
++        max_prompt_chars=sum(map(len, markers.values())),
++        max_extra_context_files=0,
++    )
++    contexts = collect_file_contexts(repo, changed_files, context_budget=budget)
++
++    assert sum(context.chars_read for context in contexts) <= budget.max_prompt_chars
++    assert {context.path: context.content for context in contexts} == markers
++
++
++def test_collect_file_contexts_applies_remaining_budget_to_extra_files(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text("helper()\n", encoding="utf-8")
++    (repo / "helper.py").write_text(
++        "def helper():\n    return 'long context'\n",
++        encoding="utf-8",
++    )
++    changed_file = ChangedFile(
++        path="app.py",
++        added_lines=[DiffLine("app.py", 1, "helper()")],
++        deleted_lines=[],
++        patch="",
++    )
++    budget = ContextBudget(max_prompt_chars=20, max_extra_context_files=1)
++
++    contexts = collect_file_contexts(repo, [changed_file], context_budget=budget)
++
++    assert [context.path for context in contexts] == ["app.py", "helper.py"]
++    assert sum(context.chars_read for context in contexts) <= budget.max_prompt_chars
++    assert contexts[1].truncated is True
++
++
++def test_collect_file_contexts_records_provenance_for_each_selection_path(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text(
++        "from helper import imported_value\ncall_target()\n",
++        encoding="utf-8",
++    )
++    (repo / "helper.py").write_text("imported_value = 1\n", encoding="utf-8")
++    (repo / "services.py").write_text(
++        "def call_target():\n    return True\n",
++        encoding="utf-8",
++    )
++    changed_file = ChangedFile(
++        path="app.py",
++        added_lines=[
++            DiffLine("app.py", 1, "from helper import imported_value"),
++            DiffLine("app.py", 2, "call_target()"),
++        ],
++        deleted_lines=[],
++        patch="",
++    )
++
++    contexts = collect_file_contexts(
++        repo,
++        [changed_file],
++        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=2),
++    )
++
++    provenance = {
++        context.path: (context.source, context.selection_reason)
++        for context in contexts
++    }
++    assert provenance == {
++        "app.py": ("changed_file", "file is changed in the pull request"),
++        "helper.py": ("import_candidate", "imported by selected context app.py"),
++        "services.py": ("call_name_candidate", "defines added call name(s): call_target"),
++    }
++
++
++def test_collect_file_contexts_keeps_the_first_provenance_for_a_duplicate_candidate(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    (repo / "app.py").write_text(
++        "from helper import helper\nhelper()\n",
++        encoding="utf-8",
++    )
++    (repo / "helper.py").write_text(
++        "def helper():\n    return True\n",
++        encoding="utf-8",
++    )
++    changed_file = ChangedFile(
++        path="app.py",
++        added_lines=[
++            DiffLine("app.py", 1, "from helper import helper"),
++            DiffLine("app.py", 2, "helper()"),
++        ],
++        deleted_lines=[],
++        patch="",
++    )
++
++    contexts = collect_file_contexts(
++        repo,
++        [changed_file],
++        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=1),
++    )
++
++    assert [context.path for context in contexts] == ["app.py", "helper.py"]
++    assert contexts[1].source == "import_candidate"
++    assert contexts[1].selection_reason == "imported by selected context app.py"
++
++
++def test_collect_file_contexts_keeps_provenance_when_selected_file_cannot_be_read(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    changed_file = ChangedFile(
++        path="missing.py",
++        added_lines=[],
++        deleted_lines=[],
++        patch="",
++    )
++
++    contexts = collect_file_contexts(
++        repo,
++        [changed_file],
++        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=0),
++    )
++
++    assert len(contexts) == 1
++    context = contexts[0]
++    assert context.exists is False
++    assert context.source == "changed_file"
++    assert context.selection_reason == "file is changed in the pull request"
++    assert "does not exist" in context.error
++
++
++def test_context_budget_rejects_invalid_limits():
++    with pytest.raises(ValueError, match="max_prompt_chars"):
++        ContextBudget(max_prompt_chars=0)
++
++    with pytest.raises(ValueError, match="max_extra_context_files"):
++        ContextBudget(max_extra_context_files=-1)
++
++
++def test_locate_python_symbol_returns_containing_function():
++    source = """def calculate_total(values):
++    total = sum(values)
++    return total
++
++
++class Ignored:
++    pass
++"""
++
++    symbol = locate_python_symbol(source, 2)
++
++    assert symbol is not None
++    assert symbol.name == "calculate_total"
++    assert symbol.kind == "function"
++    assert symbol.qualified_name == "calculate_total"
++    assert symbol.class_name is None
++    assert (symbol.start_line, symbol.end_line) == (1, 3)
++    assert symbol.source == "def calculate_total(values):\n    total = sum(values)\n    return total\n"
++
++
++def test_locate_python_symbol_distinguishes_method_and_class():
++    source = """class Processor:
++    setting = "safe"
++
++    def handle(self, value):
++        return value + 1
++"""
++
++    method = locate_python_symbol(source, 5)
++    containing_class = locate_python_symbol(source, 2)
++
++    assert method is not None
++    assert method.name == "handle"
++    assert method.kind == "method"
++    assert method.qualified_name == "Processor.handle"
++    assert method.class_name == "Processor"
++    assert (method.start_line, method.end_line) == (4, 5)
++    assert method.source == "    def handle(self, value):\n        return value + 1\n"
++
++    assert containing_class is not None
++    assert containing_class.name == "Processor"
++    assert containing_class.kind == "class"
++    assert (containing_class.start_line, containing_class.end_line) == (1, 5)
++
++
++def test_locate_python_symbol_returns_none_for_unlocatable_source_or_line():
++    assert locate_python_symbol("def broken(:\n", 1) is None
++    assert locate_python_symbol("value = 1\n", 1) is None
++    assert locate_python_symbol("def valid():\n    return 1\n", 0) is None
+diff --git a/tests/test_validation.py b/tests/test_validation.py
+index 3188e4f..70aa356 100644
+--- a/tests/test_validation.py
++++ b/tests/test_validation.py
+@@ -1,8 +1,60 @@
+ import json
+ 
+-from src.validation import validate_llm_response
+-from src.llm_reviewer import build_llm_prompt, parse_llm_response
++from src.validation import validate_issue_locations, validate_llm_response
++from src.llm_reviewer import (
++    _TRUNCATION_MARKER,
++    build_llm_prompt,
++    parse_llm_response,
++    review_with_llm,
++)
+ from src.reporter import render_json_report, render_markdown_report
++from src.schemas import ChangedFile, DiffHunk, DiffLine, FileContext, ReviewIssue
++
++
++def test_validate_issue_locations_keeps_changed_hunk_boundaries_and_repository_rules():
++    changed_files = [
++        ChangedFile(
++            path="src/app.py",
++            added_lines=[],
++            deleted_lines=[],
++            patch="",
++            hunks=[DiffHunk(10, 12), DiffHunk(20, 20)],
++        )
++    ]
++    issues = [
++        ReviewIssue("src/app.py", 10, "warning", "llm", "start", "fix", source="llm"),
++        ReviewIssue("src/app.py", 12, "warning", "llm", "end", "fix", source="llm"),
++        ReviewIssue("src/app.py", 20, "warning", "llm", "second", "fix", source="llm"),
++        ReviewIssue("(repository)", 0, "warning", "test_gap", "gap", "fix", source="rule"),
++    ]
++
++    validated = validate_issue_locations(issues, changed_files)
++
++    assert validated == issues
++
++
++def test_validate_issue_locations_drops_out_of_scope_or_unlocatable_findings():
++    changed_files = [
++        ChangedFile(
++            path="src/app.py",
++            added_lines=[],
++            deleted_lines=[],
++            patch="",
++            hunks=[DiffHunk(10, 12)],
++        )
++    ]
++    valid_issue = ReviewIssue("src/app.py", 11, "warning", "llm", "valid", "fix", source="llm")
++    invalid_issues = [
++        ReviewIssue("src/other.py", 11, "warning", "llm", "wrong file", "fix", source="llm"),
++        ReviewIssue("src/app.py", 9, "warning", "llm", "before", "fix", source="llm"),
++        ReviewIssue("src/app.py", 13, "warning", "llm", "after", "fix", source="llm"),
++        ReviewIssue(["src/app.py"], 11, "warning", "llm", "bad path", "fix", source="llm"),
++        ReviewIssue("src/app.py", True, "warning", "llm", "bad line", "fix", source="llm"),
++    ]
++
++    validated = validate_issue_locations([valid_issue, *invalid_issues], changed_files)
++
++    assert validated == [valid_issue]
+ 
+ 
+ def test_bad_json_returns_error_not_exception():
+@@ -160,3 +212,113 @@ def test_invalid_text_metadata_is_repaired_in_json_and_markdown_reports():
+     assert json_report["findings"][0]["evidence"] == ""
+     assert "| info | src/app.py | 1 | llm |  |  |  | 0.5 |  | llm |" in markdown_report
+     assert "None" not in markdown_report
++
++
++def test_llm_prompt_budget_includes_large_patch_without_contexts():
++    changed_files = [
++        ChangedFile(
++            path="src/large.py",
++            patch="+" + "x" * 5000,
++            added_lines=[],
++            deleted_lines=[],
++        )
++    ]
++
++    prompt = build_llm_prompt(
++        changed_files,
++        contexts=[],
++        rule_issues=[],
++        max_prompt_chars=4000,
++    )
++
++    assert len(prompt) <= 4000
++    assert '"patch"' in prompt
++    assert prompt.endswith(_TRUNCATION_MARKER)
++
++
++def test_llm_prompt_budget_covers_serialized_diff_lines_contexts_and_findings():
++    changed_files = [
++        ChangedFile(
++            path="src/app.py",
++            patch="patch-" + "p" * 1200,
++            added_lines=[DiffLine("src/app.py", 4, "added-" + "a" * 600)],
++            deleted_lines=[DiffLine("src/app.py", 3, "deleted-" + "d" * 600)],
++        )
++    ]
++    contexts = [
++        FileContext(
++            path="src/app.py",
++            exists=True,
++            content="context-" + "c" * 1200,
++            truncated=False,
++            chars_read=1208,
++        )
++    ]
++    findings = [
++        ReviewIssue(
++            file_path="src/app.py",
++            line_no=4,
++            severity="warning",
++            category="rule",
++            message="finding-" + "f" * 600,
++            suggestion="fix",
++        )
++    ]
++
++    prompt = build_llm_prompt(
++        changed_files,
++        contexts,
++        findings,
++        max_prompt_chars=2200,
++    )
++
++    assert len(prompt) <= 2200
++    assert '"changed_files"' in prompt
++    assert prompt.endswith(_TRUNCATION_MARKER)
++
++
++def test_llm_prompt_keeps_complete_normal_input_when_within_budget():
++    changed_files = [
++        ChangedFile(
++            path="src/app.py",
++            patch="+safe_change()",
++            added_lines=[DiffLine("src/app.py", 1, "safe_change()")],
++            deleted_lines=[],
++        )
++    ]
++    contexts = [
++        FileContext("src/app.py", True, "def safe_change():\n    return True\n", False, 35)
++    ]
++
++    prompt = build_llm_prompt(
++        changed_files,
++        contexts,
++        rule_issues=[],
++        max_prompt_chars=10000,
++    )
++
++    assert len(prompt) <= 10000
++    assert _TRUNCATION_MARKER not in prompt
++    assert "+safe_change()" in prompt
++    assert "def safe_change" in prompt
++
++
++def test_review_with_llm_sends_the_budgeted_prompt_to_the_model():
++    captured_prompts = []
++    changed_files = [
++        ChangedFile("src/app.py", [], [], "+" + "x" * 5000)
++    ]
++
++    issues, validation = review_with_llm(
++        changed_files,
++        contexts=[],
++        rule_issues=[],
++        call_model=lambda prompt: captured_prompts.append(prompt) or '{"findings": []}',
++        max_prompt_chars=4000,
++    )
++
++    assert issues == []
++    assert validation.valid is True
++    assert len(captured_prompts) == 1
++    assert len(captured_prompts[0]) <= 4000
++    assert captured_prompts[0].endswith(_TRUNCATION_MARKER)

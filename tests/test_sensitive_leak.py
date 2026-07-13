@@ -239,6 +239,39 @@ def test_l3_build_llm_prompt_redacts_secret_diff_for_each_sensitive_category(
     )
 
 
+@pytest.mark.parametrize("old_path", _L3_ALL_CASES)
+def test_l3_build_llm_prompt_redacts_secret_diff_when_sensitive_file_renamed(
+    old_path,
+):
+    """A sensitive file renamed to a non-sensitive name still carries secret
+    content in deleted_lines/patch.  The sanitizer must check old_path too.
+    """
+    changed_file = ChangedFile(
+        path="config.txt",
+        old_path=old_path,
+        is_rename=True,
+        added_lines=[DiffLine("config.txt", 1, "+safe_value=ok")],
+        deleted_lines=[DiffLine(old_path, 1, f"-API_KEY={SECRET_MARKER}")],
+        patch=f"--- a/{old_path}\n+++ b/config.txt\n@@ -1,1 +1,1 @@\n-API_KEY={SECRET_MARKER}\n+safe_value=ok\n",
+    )
+
+    prompt = build_llm_prompt(
+        changed_files=[changed_file],
+        contexts=[],
+        rule_issues=[],
+        max_prompt_chars=10000,
+    )
+
+    assert SECRET_MARKER not in prompt, (
+        f"L3 外发层泄露: 敏感文件 {old_path} 重命名为 config.txt 后，"
+        f"旧文件内容中的秘密不应出现在 LLM prompt 中"
+    )
+    assert _REDACTED_DIFF_PLACEHOLDER in prompt, (
+        f"L3 外发层: 敏感文件 {old_path} 重命名为 config.txt 后，"
+        f"diff 应被替换为 redaction placeholder"
+    )
+
+
 # ============================================================================
 # E2E: run_review_agent output + trace contain no secret marker
 # =============================================================================

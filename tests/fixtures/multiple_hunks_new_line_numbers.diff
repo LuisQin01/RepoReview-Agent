@@ -1,0 +1,11 @@
+diff --git a/service.py b/service.py
+--- a/service.py
++++ b/service.py
+@@ -2,2 +2,3 @@
+ def start():
++    first = True
+     return True
+@@ -20,2 +21,3 @@
+ def finish():
++    second = True
+     return False

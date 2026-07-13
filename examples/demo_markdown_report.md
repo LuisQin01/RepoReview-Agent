@@ -1,0 +1,135 @@
+# Repo Review Report
+
+## Summary
+
+- Changed files: 1
+- Findings: 10
+- Errors: 4
+- Warnings: 5
+- Info: 1
+
+## Changed Files
+
+| File | Added Lines | Deleted Lines | Context |
+| --- | ---: | ---: | --- |
+| app.py | 6 | 1 | missing: File app.py does not exist |
+
+## Context Files
+
+| File | Type | Status |
+| --- | --- | --- |
+| app.py | changed | missing: File app.py does not exist |
+
+## Findings
+
+| Severity | File | Line | Category | Issue | Suggestion |
+| --- | --- | ---: | --- | --- | --- |
+| error | app.py | 3 | secret | 新增代码当中包含疑似硬编码的密码/密钥/令牌 | 请不要在代码中硬编码密码/密钥/令牌，改成从配置文件或者环境变量读取 |
+| error | app.py | 3 | sensitive_log | 新增调试输出可能泄露密码、token 或 secret | 不要打印敏感字段，必要时做脱敏处理 |
+| error | app.py | 5 | secret | 新增代码疑似包含硬编码 key/token/password/secret | 不要硬编码敏感信息，改成从环境变量或安全配置读取。 |
+| error | app.py | 5 | secret | 新增代码当中包含疑似硬编码的密码/密钥/令牌 | 请不要在代码中硬编码密码/密钥/令牌，改成从配置文件或者环境变量读取 |
+| warning | (repository) | 0 | test_gap | 本次修改包含业务代码，但是没有看到测试文件变更 | 如果行为发生变化，建议补充或更新对应测试 |
+| warning | app.py | 3 | debug | 新增代码当中包含print调试输出 | 删除print，或者改成正式的日志记录 |
+| warning | app.py | 4 | debug | 新增代码当中包含debugger调试输出 | 删除debugger，或者改成正式的日志记录 |
+| warning | app.py | 6 | exception_handling | 新增代码包含可能失败的 I/O、网络、解析或系统调用，但 patch 中没有明显异常处理 | 考虑添加 try/except，或让错误以清晰方式向上传递。 |
+| warning | app.py | 7 | exception_handling | 新增代码包含可能失败的 I/O、网络、解析或系统调用，但 patch 中没有明显异常处理 | 考虑添加 try/except，或让错误以清晰方式向上传递。 |
+| info | app.py | 2 | todo | 新增代码当中包含TODO/FIXME | 现在解决它，或者将其链接到一个跟踪的后续任务 |
+
+## JSON Output
+
+```json
+{
+  "findings": [
+    {
+      "severity": "medium",
+      "file": "(repository)",
+      "line": 0,
+      "issue": "本次修改包含业务代码，但是没有看到测试文件变更",
+      "reason": "test_gap",
+      "suggested_fix": "如果行为发生变化，建议补充或更新对应测试",
+      "confidence": 1.0
+    },
+    {
+      "severity": "low",
+      "file": "app.py",
+      "line": 2,
+      "issue": "新增代码当中包含TODO/FIXME",
+      "reason": "todo",
+      "suggested_fix": "现在解决它，或者将其链接到一个跟踪的后续任务",
+      "confidence": 1.0
+    },
+    {
+      "severity": "medium",
+      "file": "app.py",
+      "line": 3,
+      "issue": "新增代码当中包含print调试输出",
+      "reason": "debug",
+      "suggested_fix": "删除print，或者改成正式的日志记录",
+      "confidence": 1.0
+    },
+    {
+      "severity": "high",
+      "file": "app.py",
+      "line": 3,
+      "issue": "新增调试输出可能泄露密码、token 或 secret",
+      "reason": "sensitive_log",
+      "suggested_fix": "不要打印敏感字段，必要时做脱敏处理",
+      "confidence": 1.0
+    },
+    {
+      "severity": "high",
+      "file": "app.py",
+      "line": 3,
+      "issue": "新增代码当中包含疑似硬编码的密码/密钥/令牌",
+      "reason": "secret",
+      "suggested_fix": "请不要在代码中硬编码密码/密钥/令牌，改成从配置文件或者环境变量读取",
+      "confidence": 1.0
+    },
+    {
+      "severity": "medium",
+      "file": "app.py",
+      "line": 4,
+      "issue": "新增代码当中包含debugger调试输出",
+      "reason": "debug",
+      "suggested_fix": "删除debugger，或者改成正式的日志记录",
+      "confidence": 1.0
+    },
+    {
+      "severity": "high",
+      "file": "app.py",
+      "line": 5,
+      "issue": "新增代码疑似包含硬编码 key/token/password/secret",
+      "reason": "secret",
+      "suggested_fix": "不要硬编码敏感信息，改成从环境变量或安全配置读取。",
+      "confidence": 1.0
+    },
+    {
+      "severity": "high",
+      "file": "app.py",
+      "line": 5,
+      "issue": "新增代码当中包含疑似硬编码的密码/密钥/令牌",
+      "reason": "secret",
+      "suggested_fix": "请不要在代码中硬编码密码/密钥/令牌，改成从配置文件或者环境变量读取",
+      "confidence": 1.0
+    },
+    {
+      "severity": "medium",
+      "file": "app.py",
+      "line": 6,
+      "issue": "新增代码包含可能失败的 I/O、网络、解析或系统调用，但 patch 中没有明显异常处理",
+      "reason": "exception_handling",
+      "suggested_fix": "考虑添加 try/except，或让错误以清晰方式向上传递。",
+      "confidence": 1.0
+    },
+    {
+      "severity": "medium",
+      "file": "app.py",
+      "line": 7,
+      "issue": "新增代码包含可能失败的 I/O、网络、解析或系统调用，但 patch 中没有明显异常处理",
+      "reason": "exception_handling",
+      "suggested_fix": "考虑添加 try/except，或让错误以清晰方式向上传递。",
+      "confidence": 1.0
+    }
+  ]
+}
+```

@@ -32,9 +32,11 @@ def issue_to_finding(issue):
         "file":issue.file_path,
         "line":issue.line_no,
         "issue":issue.message,
-        "reason":issue.category,
+        "reason":issue.reason,
         "suggested_fix":issue.suggestion,
-        "confidence":1.0,
+        "confidence":issue.confidence,
+        "evidence":issue.evidence,
+        "source":issue.source,
     }
 
 def render_json_report(issues):
@@ -129,8 +131,8 @@ def render_markdown_report(issues, changed_files, contexts):
         lines.append("No issues found.")
     else:
         lines.extend([
-        "| Severity | File | Line | Category | Issue | Suggestion |",
-        "| --- | --- | ---: | --- | --- | --- |",
+        "| Severity | File | Line | Category | Issue | Reason | Suggestion | Confidence | Evidence | Source |",
+        "| --- | --- | ---: | --- | --- | --- | --- | ---: | --- | --- |",
         ])
             
         severity_order={"error":0, "warning":1, "info":2}
@@ -155,7 +157,11 @@ def render_markdown_report(issues, changed_files, contexts):
                         str(issue.line_no),
                         _escape_table_cell(issue.category),
                         _escape_table_cell(issue.message),
+                        _escape_table_cell(issue.reason),
                         _escape_table_cell(issue.suggestion),
+                        _escape_table_cell("" if issue.confidence is None else issue.confidence),
+                        _escape_table_cell(issue.evidence),
+                        _escape_table_cell(issue.source),
                     ]
                 )
                 + " |"

@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass, field
 
 VALID_SEVERITIES = {"high", "medium", "low"}
@@ -47,6 +48,11 @@ def validate_llm_response(response_text: str) -> ValidationResult:
 
         normalized = dict(finding)
 
+        if "source" in normalized:
+            normalized.pop("source")
+            result.repaired = True
+            result.errors.append(f"llm_finding_{index}_ignored_source")
+
         # 拿到的严重性不在有效范围内，修复为 medium
         if normalized.get("severity") not in VALID_SEVERITIES:
             normalized["severity"] = "medium"
@@ -85,6 +91,11 @@ def validate_llm_response(response_text: str) -> ValidationResult:
             normalized["confidence"]=0.5
             result.repaired=True
             result.errors.append(f"llm_finding_{index}_invalid_confidence")
+
+        if not math.isfinite(normalized["confidence"]):
+            normalized["confidence"]=0.5
+            result.repaired=True
+            result.errors.append(f"llm_finding_{index}_non_finite_confidence")
         
         if normalized["confidence"]<0 or normalized["confidence"]>1:
             normalized["confidence"]=max(0.0,min(1.0, normalized["confidence"]))
@@ -92,11 +103,15 @@ def validate_llm_response(response_text: str) -> ValidationResult:
             result.errors.append(f"llm_finding_{index}_confidence_out_of_range")
     
         # 确保每个发现都有 issue、reason 和 suggested_fix 字段，如果缺少则修复为默认值
-        for field_name in ["issue", "reason", "suggested_fix"]:
+        for field_name in ["issue", "reason", "suggested_fix", "evidence"]:
             if field_name not in normalized:
                 normalized[field_name] = ""
                 result.repaired = True
                 result.errors.append(f"llm_finding_{index}_missing_{field_name}")
+            elif not isinstance(normalized[field_name], str):
+                normalized[field_name] = ""
+                result.repaired = True
+                result.errors.append(f"llm_finding_{index}_invalid_{field_name}_type")
         # 重点：修复后的 finding 要放进结果里
         result.findings.append(normalized)
 

@@ -5,7 +5,7 @@
 '''
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 @dataclass
 class DiffLine:
@@ -19,6 +19,8 @@ class ChangedFile:
     added_lines:List[DiffLine]
     deleted_lines:List[DiffLine]
     patch:str
+    old_path:Optional[str]=None
+    is_rename:bool=False
 
 @dataclass
 class ReviewIssue:
@@ -38,6 +40,11 @@ class ReviewIssue:
     category:str
     message:str
     suggestion:str
+    reason:str=""
+    confidence:Optional[float]=None
+    evidence:str=""
+    # System-assigned provenance: "rule" or "llm". Never accept it from LLM output.
+    source:str=""
 
 @dataclass
 class FileContext:

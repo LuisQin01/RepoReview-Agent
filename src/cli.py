@@ -58,6 +58,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--mock-fixture",
+        choices=["normal", "bad_json", "timeout", "empty"],
+        default="normal",
+        help="Mock LLM response fixture to use when --llm-provider=mock",
+    )
+
+    parser.add_argument(
         "--trace",
         action="store_true",
         help="Save trace json after review",
@@ -220,7 +227,10 @@ def run_review_agent(args):
 
     if state.use_llm:
         try:    
-            call_model=get_call_model(state.llm_provider)
+            call_model=get_call_model(
+                state.llm_provider,
+                mock_fixture=getattr(args, "mock_fixture", "normal"),
+            )
 
             state.llm_issues, validation = review_with_llm(
                 changed_files=state.changed_files,

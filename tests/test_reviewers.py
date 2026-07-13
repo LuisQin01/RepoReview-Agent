@@ -18,3 +18,4 @@ def test_reviewers_find_hardcoded_secret():
     categories = {issue.category for issue in issues}
 
     assert "secret" in categories
+    assert all(issue.source == "rule" for issue in issues)

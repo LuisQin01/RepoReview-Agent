@@ -31,6 +31,7 @@ def _issue(line, severity, category, message, suggestion):
         category=category,
         message=message,
         suggestion=suggestion,
+        source="rule",
     )
 
 def _repo_issue(severity, category, message, suggestion):
@@ -41,6 +42,7 @@ def _repo_issue(severity, category, message, suggestion):
         category=category,
         message=message,
         suggestion=suggestion,
+        source="rule",
     )
 
 def _normalized_path(path):
@@ -161,6 +163,7 @@ def review_changed_files(changed_files):
                         category="debug",
                         message="新增代码当中包含print调试输出",
                         suggestion="删除print，或者改成正式的日志记录",
+                        source="rule",
                     )
                 )
 
@@ -173,6 +176,7 @@ def review_changed_files(changed_files):
                         category="debug",
                         message="新增代码当中包含debugger调试输出",
                         suggestion="删除debugger，或者改成正式的日志记录",
+                        source="rule",
                     )
                 )
 

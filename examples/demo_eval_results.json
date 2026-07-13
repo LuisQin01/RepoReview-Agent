@@ -1,0 +1,86 @@
+{
+  "cases": 5,
+  "category_hit_rate": 1.0,
+  "false_positive_count": 0,
+  "json_valid_rate": 1.0,
+  "average_findings": 2.0,
+  "average_duration_ms": 117.2,
+  "results": [
+    {
+      "case_id": "clean_change_no_issue",
+      "passed": true,
+      "json_valid": true,
+      "expected_categories": [],
+      "actual_categories": [],
+      "findings_count": 0,
+      "false_positive": false,
+      "duration_ms": 147,
+      "error": ""
+    },
+    {
+      "case_id": "deleted_exception_handling",
+      "passed": true,
+      "json_valid": true,
+      "expected_categories": [
+        "exception_handling"
+      ],
+      "actual_categories": [
+        "exception_handling",
+        "test_gap"
+      ],
+      "findings_count": 3,
+      "false_positive": false,
+      "duration_ms": 122,
+      "error": ""
+    },
+    {
+      "case_id": "hardcoded_secret",
+      "passed": true,
+      "json_valid": true,
+      "expected_categories": [
+        "secret"
+      ],
+      "actual_categories": [
+        "secret",
+        "test_gap"
+      ],
+      "findings_count": 2,
+      "false_positive": false,
+      "duration_ms": 112,
+      "error": ""
+    },
+    {
+      "case_id": "missing_test",
+      "passed": true,
+      "json_valid": true,
+      "expected_categories": [
+        "test_gap"
+      ],
+      "actual_categories": [
+        "test_gap"
+      ],
+      "findings_count": 1,
+      "false_positive": false,
+      "duration_ms": 107,
+      "error": ""
+    },
+    {
+      "case_id": "sensitive_log",
+      "passed": true,
+      "json_valid": true,
+      "expected_categories": [
+        "sensitive_log"
+      ],
+      "actual_categories": [
+        "debug",
+        "secret",
+        "sensitive_log",
+        "test_gap"
+      ],
+      "findings_count": 4,
+      "false_positive": false,
+      "duration_ms": 98,
+      "error": ""
+    }
+  ]
+}

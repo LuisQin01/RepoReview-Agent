@@ -41,10 +41,13 @@ JSON 格式固定如下：
       "issue": "问题描述",
       "reason": "为什么这是问题",
       "suggested_fix": "建议如何修复",
-      "confidence": 0.8
+      "confidence": 0.8,
+      "evidence": "支持该问题的代码或行号"
     }}
   ]
 }}
+
+source 字段由系统根据调用路径赋值；不要在 JSON 中输出 source。
 
 输入如下：
 {json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -70,7 +73,11 @@ def parse_llm_response(response_text):
                 severity=_severity_from_llm(finding["severity"]),
                 category="llm",
                 message=finding["issue"],
-                suggestion=finding["suggested_fix"]
+                suggestion=finding["suggested_fix"],
+                reason=finding["reason"],
+                confidence=finding["confidence"],
+                evidence=finding["evidence"],
+                source="llm",
             )
         )
     return issues, validation

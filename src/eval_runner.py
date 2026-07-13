@@ -70,11 +70,16 @@ def run_one_case(
     should_find=expected.get("should_find", True)
 
     if should_find:
-        passed = expected_categories.issubset(actual_categories)
+        unexpected_categories = actual_categories - expected_categories
+        false_positive = bool(unexpected_categories)
+        passed = (
+            json_valid
+            and expected_categories.issubset(actual_categories)
+            and not false_positive
+        )
     else:
-        passed=len(findings) == 0
-
-    false_positive=(not should_find) and (len(findings) > 0)
+        false_positive = len(findings) > 0
+        passed = json_valid and not false_positive
 
     return {
         "case_id": expected.get("case_id", case_dir.name),

@@ -1,6 +1,6 @@
 import pytest
 
-from src.file_context import collect_file_contexts, read_file_context
+from src.file_context import collect_file_contexts, locate_python_symbol, read_file_context
 from src.schemas import ChangedFile, ContextBudget, DiffHunk, DiffLine
 
 
@@ -205,3 +205,55 @@ def test_context_budget_rejects_invalid_limits():
 
     with pytest.raises(ValueError, match="max_extra_context_files"):
         ContextBudget(max_extra_context_files=-1)
+
+
+def test_locate_python_symbol_returns_containing_function():
+    source = """def calculate_total(values):
+    total = sum(values)
+    return total
+
+
+class Ignored:
+    pass
+"""
+
+    symbol = locate_python_symbol(source, 2)
+
+    assert symbol is not None
+    assert symbol.name == "calculate_total"
+    assert symbol.kind == "function"
+    assert symbol.qualified_name == "calculate_total"
+    assert symbol.class_name is None
+    assert (symbol.start_line, symbol.end_line) == (1, 3)
+    assert symbol.source == "def calculate_total(values):\n    total = sum(values)\n    return total\n"
+
+
+def test_locate_python_symbol_distinguishes_method_and_class():
+    source = """class Processor:
+    setting = "safe"
+
+    def handle(self, value):
+        return value + 1
+"""
+
+    method = locate_python_symbol(source, 5)
+    containing_class = locate_python_symbol(source, 2)
+
+    assert method is not None
+    assert method.name == "handle"
+    assert method.kind == "method"
+    assert method.qualified_name == "Processor.handle"
+    assert method.class_name == "Processor"
+    assert (method.start_line, method.end_line) == (4, 5)
+    assert method.source == "    def handle(self, value):\n        return value + 1\n"
+
+    assert containing_class is not None
+    assert containing_class.name == "Processor"
+    assert containing_class.kind == "class"
+    assert (containing_class.start_line, containing_class.end_line) == (1, 5)
+
+
+def test_locate_python_symbol_returns_none_for_unlocatable_source_or_line():
+    assert locate_python_symbol("def broken(:\n", 1) is None
+    assert locate_python_symbol("value = 1\n", 1) is None
+    assert locate_python_symbol("def valid():\n    return 1\n", 0) is None

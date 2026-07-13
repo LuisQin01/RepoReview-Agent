@@ -3,12 +3,13 @@
 比如说120行变了，找到前后20行，100-140
 然后把上下文挂到 changed_file.hunks.context_lines 里面
 
-后面可以实现函数边界和class边界，使用tree-sitter来解析python文件，找到函数和类的边界，然后把上下文挂到 changed_file.hunks.context_lines 里面
+Python 文件可以使用标准库 ast 定位变更行所属的函数、方法或类。
 '''
+import ast
 import re
 
 from pathlib import Path
-from .schemas import ContextBudget, DiffHunk, FileContext
+from .schemas import ContextBudget, DiffHunk, FileContext, PythonSymbol
 
 IGNORED_DIRS={".git", "__pycache__", ".venv", "venv", "node_modules", "traces"}
 
@@ -20,6 +21,71 @@ def _error_context(file_path,message):
         truncated=False,
         chars_read=0,
         error=message
+    )
+
+def locate_python_symbol(source, line_no):
+    """Return the innermost Python symbol containing ``line_no``.
+
+    Invalid Python and lines outside a symbol deliberately return ``None`` so
+    callers can fall back to their existing file-level context.
+    """
+    if line_no < 1:
+        return None
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+    source_lines = source.splitlines(keepends=True)
+    symbols = []
+
+    def visit(node, parents=(), class_names=()):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            decorator_lines = [decorator.lineno for decorator in node.decorator_list]
+            start_line = min([node.lineno, *decorator_lines])
+            end_line = node.end_lineno or node.lineno
+            parent = parents[-1] if parents else None
+
+            if isinstance(node, ast.ClassDef):
+                kind = "class"
+                next_class_names = (*class_names, node.name)
+            else:
+                kind = "method" if isinstance(parent, ast.ClassDef) else "function"
+                next_class_names = class_names
+
+            symbol_names = [parent_node.name for parent_node in parents]
+            qualified_name = ".".join([*symbol_names, node.name])
+            symbols.append(
+                PythonSymbol(
+                    name=node.name,
+                    kind=kind,
+                    start_line=start_line,
+                    end_line=end_line,
+                    source="".join(source_lines[start_line - 1:end_line]),
+                    qualified_name=qualified_name,
+                    class_name=".".join(class_names) or None,
+                )
+            )
+            parents = (*parents, node)
+            class_names = next_class_names
+
+        for child in ast.iter_child_nodes(node):
+            visit(child, parents, class_names)
+
+    visit(tree)
+
+    containing_symbols = [
+        symbol
+        for symbol in symbols
+        if symbol.start_line <= line_no <= symbol.end_line
+    ]
+    if not containing_symbols:
+        return None
+
+    return min(
+        containing_symbols,
+        key=lambda symbol: (symbol.end_line - symbol.start_line, -symbol.start_line),
     )
 
 def _truncate_to_changed_lines(content, changed_line_nos, max_chars):

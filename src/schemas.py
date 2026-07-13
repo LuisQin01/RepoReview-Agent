@@ -69,6 +69,17 @@ class FileContext:
     chars_read:int
     error:str=""
 
+@dataclass
+class PythonSymbol:
+    '''A Python class, function, or method located from a source line.'''
+    name:str
+    kind:str
+    start_line:int
+    end_line:int
+    source:str
+    qualified_name:str
+    class_name:Optional[str]=None
+
 @dataclass(frozen=True, init=False)
 class ContextBudget:
     '''Limits the complete prompt sent to the LLM for one review run.

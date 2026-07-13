@@ -3,6 +3,7 @@ import json
 import pytest
 
 from src import eval_runner
+from src.schemas import ContextBudget
 
 
 def make_case(tmp_path, *, expected_categories, should_find):
@@ -84,6 +85,23 @@ def test_run_one_case_marks_runner_failure_as_not_passed(tmp_path, monkeypatch):
     assert result["passed"] is False
     assert result["false_positive"] is False
     assert result["error"] == "review failed"
+
+
+def test_run_one_case_passes_context_budget_to_review_agent(tmp_path, monkeypatch):
+    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
+    budget = ContextBudget(max_prompt_chars=17, max_extra_context_files=0)
+
+    def fake_review(args):
+        assert args.context_budget is budget
+        assert args.max_prompt_chars == 17
+        assert args.max_extra_context_files == 0
+        return json.dumps({"findings": []}), []
+
+    monkeypatch.setattr(eval_runner, "run_review_agent", fake_review)
+
+    result = eval_runner.run_one_case(case_dir, tmp_path, context_budget=budget)
+
+    assert result["passed"] is True
 
 
 def test_run_eval_aggregates_case_metrics(tmp_path, monkeypatch):

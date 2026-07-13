@@ -1,6 +1,21 @@
 # RepoReview Agent
 通过参考[The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent)来实现一个Agent项目，用来进行本地代码审查，可以读取git diff和相关上下文来给出结构化的review建议
 
+## Setup
+
+The timeout and retry implementation is verified with Python 3.11.7,
+OpenAI SDK 1.109.1, and pytest 7.4.0. Install the declared dependencies:
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+Run the test suite without calling the OpenAI API:
+
+```powershell
+py -m pytest tests/ -v
+```
+
 ## Agent Loop
 
 RepoReview Agent uses a fixed-step loop for now:

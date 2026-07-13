@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from time import perf_counter
 
 from .cli import run_review_agent
+from .schemas import ContextBudget
 
 def load_expected(case_dir: Path):
     expected_path = case_dir / "expected.json"
@@ -33,20 +34,23 @@ def run_one_case(
         repo_root: Path,
         use_llm: bool = False,
         llm_provider: str = "mock",
+        context_budget: ContextBudget | None = None,
         ):
     expected = load_expected(case_dir)
+    context_budget = context_budget or ContextBudget()
 
     args=SimpleNamespace(
         diff=str(case_dir / "input.diff"),
         repo=str(repo_root),
-        max_context_chars=4000,
+        max_prompt_chars=context_budget.max_prompt_chars,
         format="json",
         output=None,
         llm=use_llm,
         llm_provider=llm_provider,
         trace=False,
         trace_dir="traces",
-        max_extra_context_files=3,
+        max_extra_context_files=context_budget.max_extra_context_files,
+        context_budget=context_budget,
     )
 
     started=perf_counter()

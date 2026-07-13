@@ -22,7 +22,7 @@ ChangedFile:
 import re
 import shlex
 
-from .schemas import ChangedFile, DiffLine
+from .schemas import ChangedFile, DiffHunk, DiffLine
 
 
 def _parse_git_path(value, prefix=None):
@@ -62,7 +62,7 @@ def _parse_diff_git_paths(line):
 
 
 def _build_changed_file(
-    path, added_lines, deleted_lines, patch_lines, old_path, is_rename
+    path, added_lines, deleted_lines, patch_lines, old_path, is_rename, hunks
 ):
     return ChangedFile(
         path=path,
@@ -71,6 +71,7 @@ def _build_changed_file(
         patch="\n".join(patch_lines),
         old_path=old_path if is_rename else None,
         is_rename=is_rename,
+        hunks=hunks,
     )
 
 
@@ -81,6 +82,7 @@ def parse_diff(diff_text: str):
     current_is_rename = False
     current_added_lines = []
     current_deleted_lines = []
+    current_hunks = []
     current_patch_lines = []
     current_old_line = None
     current_new_line = None
@@ -96,6 +98,7 @@ def parse_diff(diff_text: str):
                         current_patch_lines,
                         current_old_path,
                         current_is_rename,
+                        current_hunks,
                     )
                 )
 
@@ -103,6 +106,7 @@ def parse_diff(diff_text: str):
             current_is_rename = False
             current_added_lines = []
             current_deleted_lines = []
+            current_hunks = []
             current_patch_lines = [line]
             current_old_line = None
             current_new_line = None
@@ -122,10 +126,19 @@ def parse_diff(diff_text: str):
             if new_path != "/dev/null":
                 current_file = new_path
         elif line.startswith("@@"):
-            match = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            match = re.search(
+                r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line
+            )
             if match:
                 current_old_line = int(match.group(1))
-                current_new_line = int(match.group(2))
+                current_new_line = int(match.group(3))
+                new_line_count = int(match.group(4) or 1)
+                current_hunks.append(
+                    DiffHunk(
+                        start_line=current_new_line,
+                        end_line=current_new_line + new_line_count - 1,
+                    )
+                )
         elif line.startswith("+") and not line.startswith("+++"):
             # A malformed diff can contain a line outside a hunk. Keep its raw
             # patch text but do not invent a line number for review findings.
@@ -163,6 +176,7 @@ def parse_diff(diff_text: str):
                 current_patch_lines,
                 current_old_path,
                 current_is_rename,
+                current_hunks,
             )
         )
 

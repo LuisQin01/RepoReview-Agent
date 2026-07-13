@@ -2,6 +2,7 @@ from pathlib import Path
 
 from src.diff_parser import parse_diff
 from src.file_context import collect_file_contexts
+from src.schemas import ContextBudget, DiffHunk
 from src.reporter import render_markdown_report
 from src.reviewers import review_changed_files
 
@@ -31,6 +32,7 @@ def test_parse_added_and_deleted_lines():
     assert len(changed.deleted_lines) == 1
     assert changed.deleted_lines[0].line_no == 2
     assert changed.deleted_lines[0].content == "    old_debug = True"
+    assert changed.hunks == [DiffHunk(start_line=1, end_line=3)]
 
 
 def test_parse_pure_rename_records_old_and_new_path():
@@ -125,6 +127,10 @@ def test_parse_new_line_numbers_across_multiple_hunks():
         ("service.py", 3, "    first = True"),
         ("service.py", 22, "    second = True"),
     ]
+    assert changed.hunks == [
+        DiffHunk(start_line=2, end_line=4),
+        DiffHunk(start_line=21, end_line=23),
+    ]
 
 
 def test_rename_and_space_path_do_not_break_downstream_consumers(tmp_path):
@@ -144,7 +150,11 @@ rename to new name.py
 """
     )
 
-    contexts = collect_file_contexts(repo, changed_files, max_extra_files=0)
+    contexts = collect_file_contexts(
+        repo,
+        changed_files,
+        context_budget=ContextBudget(max_extra_context_files=0),
+    )
     issues = review_changed_files(changed_files)
     report = render_markdown_report(issues, changed_files, contexts)
 

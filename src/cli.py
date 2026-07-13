@@ -21,6 +21,7 @@ from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
 from .llm_reviewer import review_with_llm
 from .llm_client import get_call_model, LLMClientError
+from .validation import validate_issue_locations
 
 
 def parse_args():
@@ -153,10 +154,10 @@ def record_step(state, step, detail=None):
         "detail":detail or {},
     })
 
-def validate_issues(issues):
+def validate_issues(issues, changed_files):
     if not isinstance(issues, list):
         raise ValueError("Issues should be a list")
-    return issues
+    return validate_issue_locations(issues, changed_files)
 
 def mock_call_model(prompt):
     return """
@@ -287,7 +288,7 @@ def run_review_agent(args):
             "called":False,
         })
 
-    state.issues = validate_issues(state.issues)
+    state.issues = validate_issues(state.issues, state.changed_files)
     record_step(state, "validate_output",{
         "findings":len(state.issues),
     })

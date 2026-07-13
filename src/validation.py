@@ -12,6 +12,44 @@ class ValidationResult:
     repaired: bool=False
     errors: list[str]=field(default_factory=list)
 
+
+def validate_issue_locations(issues, changed_files):
+    """Keep only findings that can be published against changed hunks.
+
+    Repository-level rule findings are intentionally retained because they are
+    not inline findings and are produced by trusted deterministic rules.
+    """
+    hunks_by_path = {}
+    for changed_file in changed_files:
+        hunks_by_path.setdefault(changed_file.path, []).extend(changed_file.hunks)
+
+    validated_issues = []
+    for issue in issues:
+        if (
+            getattr(issue, "source", None) == "rule"
+            and getattr(issue, "file_path", None) == "(repository)"
+            and getattr(issue, "line_no", None) == 0
+        ):
+            validated_issues.append(issue)
+            continue
+
+        file_path = getattr(issue, "file_path", None)
+        line_no = getattr(issue, "line_no", None)
+        if (
+            not isinstance(file_path, str)
+            or isinstance(line_no, bool)
+            or not isinstance(line_no, int)
+        ):
+            continue
+
+        if any(
+            hunk.start_line <= line_no <= hunk.end_line
+            for hunk in hunks_by_path.get(file_path, [])
+        ):
+            validated_issues.append(issue)
+
+    return validated_issues
+
 def validate_llm_response(response_text: str) -> ValidationResult:
     result = ValidationResult()
 

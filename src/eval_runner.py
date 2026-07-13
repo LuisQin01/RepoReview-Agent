@@ -29,6 +29,19 @@ def extract_categories(findings):
             categories.add(category)
     return categories
 
+
+def _category_counts(actual_categories, expected_categories):
+    """Return category-level true-positive, false-positive, and false-negative counts."""
+    true_positive_count = len(actual_categories & expected_categories)
+    false_positive_count = len(actual_categories - expected_categories)
+    false_negative_count = len(expected_categories - actual_categories)
+    return true_positive_count, false_positive_count, false_negative_count
+
+
+def _safe_ratio(numerator, denominator):
+    return numerator / denominator if denominator else 0.0
+
+
 def run_one_case(
         case_dir: Path,
         repo_root: Path,
@@ -60,7 +73,28 @@ def run_one_case(
         duration_ms=int((perf_counter() - started) * 1000)
 
         data=json.loads(output)
-        findings=data.get("findings", [])
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"reviewer JSON top-level must be an object, got {type(data).__name__}"
+            )
+        if "findings" not in data:
+            raise ValueError("reviewer JSON is missing required 'findings' field")
+        findings=data["findings"]
+        if not isinstance(findings, list):
+            raise ValueError(
+                f"reviewer JSON 'findings' must be a list, got {type(findings).__name__}"
+            )
+        invalid_finding_index = next(
+            (index for index, finding in enumerate(findings) if not isinstance(finding, dict)),
+            None,
+        )
+        if invalid_finding_index is not None:
+            invalid_finding = findings[invalid_finding_index]
+            raise ValueError(
+                "reviewer JSON "
+                f"'findings[{invalid_finding_index}]' must be an object, "
+                f"got {type(invalid_finding).__name__}"
+            )
         json_valid=True
         error=""
     except Exception as exc:
@@ -74,14 +108,17 @@ def run_one_case(
     should_find=expected.get("should_find", True)
 
     if should_find:
-        unexpected_categories = actual_categories - expected_categories
-        false_positive = bool(unexpected_categories)
+        tp, fp, fn = _category_counts(actual_categories, expected_categories)
+        false_positive = fp > 0
         passed = (
             json_valid
             and expected_categories.issubset(actual_categories)
             and not false_positive
         )
     else:
+        tp = 0
+        fp = len(findings)
+        fn = 0
         false_positive = len(findings) > 0
         passed = json_valid and not false_positive
 
@@ -93,6 +130,10 @@ def run_one_case(
         "actual_categories": sorted(actual_categories),
         "findings_count": len(findings),
         "false_positive": false_positive,
+        "is_negative_case": not should_find,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
         "duration_ms": duration_ms,
         "error": error,
     }
@@ -119,6 +160,18 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock"):
     false_positive_count = sum(1 for result in results if result["false_positive"])
     total_findings = sum(result["findings_count"] for result in results)
     total_duration = sum(result["duration_ms"] for result in results)
+    total_tp = sum(result["tp"] for result in results)
+    total_fp = sum(result["fp"] for result in results)
+    total_fn = sum(result["fn"] for result in results)
+    negative_case_count = sum(1 for result in results if result["is_negative_case"])
+    false_positive_negative_case_count = sum(
+        1
+        for result in results
+        if result["is_negative_case"] and result["false_positive"]
+    )
+    precision = _safe_ratio(total_tp, total_tp + total_fp)
+    recall = _safe_ratio(total_tp, total_tp + total_fn)
+    f1 = _safe_ratio(2 * precision * recall, precision + recall)
 
     metrics = {
         "cases": case_count,
@@ -127,6 +180,14 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock"):
         "json_valid_rate": json_valid_count / case_count if case_count else 0,
         "average_findings": total_findings / case_count if case_count else 0,
         "average_duration_ms": total_duration / case_count if case_count else 0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_positive_rate": _safe_ratio(
+            false_positive_negative_case_count,
+            negative_case_count,
+        ),
+        "false_negative_count": total_fn,
         "results": results,
     }
 
@@ -158,6 +219,11 @@ def main():
     print(f"json_valid_rate: {metrics['json_valid_rate']:.2f}")
     print(f"average_findings: {metrics['average_findings']:.2f}")
     print(f"average_duration_ms: {metrics['average_duration_ms']:.0f}")
+    print(f"precision: {metrics['precision']:.2f}")
+    print(f"recall: {metrics['recall']:.2f}")
+    print(f"f1: {metrics['f1']:.2f}")
+    print(f"false_positive_rate: {metrics['false_positive_rate']:.2f}")
+    print(f"false_negative_count: {metrics['false_negative_count']}")
 
     print()
     print(json.dumps(metrics["results"], ensure_ascii=False, indent=2))

@@ -206,6 +206,7 @@ def test_invalid_text_metadata_is_repaired_in_json_and_markdown_reports():
         "llm_finding_0_invalid_suggested_fix_type",
         "llm_finding_0_invalid_evidence_type",
     }.issubset(validation.errors)
+    assert json_report["findings"][0]["category"] == "llm"
     assert json_report["findings"][0]["issue"] == ""
     assert json_report["findings"][0]["reason"] == ""
     assert json_report["findings"][0]["suggested_fix"] == ""

@@ -29,6 +29,7 @@ def _context_status(context):
 def issue_to_finding(issue):
     return {
         "severity":_severity_for_json(issue.severity),
+        "category":issue.category,
         "file":issue.file_path,
         "line":issue.line_no,
         "issue":issue.message,

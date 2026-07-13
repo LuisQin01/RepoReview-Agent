@@ -3,7 +3,7 @@ from typing import List
 from time import perf_counter
 from uuid import uuid4
 
-from .schemas import ChangedFile, FileContext, ReviewIssue
+from .schemas import ChangedFile, ContextBudget, FileContext, ReviewIssue
 
 @dataclass
 class ReviewState:
@@ -11,8 +11,7 @@ class ReviewState:
     repo_root:str
     output_format:str
     use_llm:bool
-    max_context_chars:int
-    max_extra_context_files:int=3
+    context_budget:ContextBudget
     llm_provider:str="mock"
 
     diff_text:str=""

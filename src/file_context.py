@@ -8,7 +8,7 @@
 import re
 
 from pathlib import Path
-from .schemas import FileContext
+from .schemas import ContextBudget, DiffHunk, FileContext
 
 IGNORED_DIRS={".git", "__pycache__", ".venv", "venv", "node_modules", "traces"}
 
@@ -22,7 +22,111 @@ def _error_context(file_path,message):
         error=message
     )
 
-def read_file_context(repo_root, file_path, max_chars=4000):
+def _truncate_to_changed_lines(content, changed_line_nos, max_chars):
+    if len(content) <= max_chars:
+        return content, False
+
+    valid_line_nos = sorted({
+        line_no
+        for line_no in changed_line_nos or []
+        if isinstance(line_no, int) and line_no > 0
+    })
+    if not valid_line_nos:
+        return content[:max_chars], True
+
+    lines = content.splitlines(keepends=True)
+    selected = []
+    remaining_chars = max_chars
+
+    for line_no in valid_line_nos:
+        if line_no > len(lines) or remaining_chars == 0:
+            continue
+        line = lines[line_no - 1]
+        selected.append(line[:remaining_chars])
+        remaining_chars -= len(selected[-1])
+
+    if selected:
+        return "".join(selected), True
+
+    return content[:max_chars], True
+
+
+def _normalize_hunks(changed_hunks):
+    """Return valid, ordered new-file hunk ranges without merging them."""
+    normalized = []
+    for hunk in changed_hunks or []:
+        if isinstance(hunk, DiffHunk):
+            start_line, end_line = hunk.start_line, hunk.end_line
+        elif isinstance(hunk, (tuple, list)) and len(hunk) == 2:
+            start_line, end_line = hunk
+        else:
+            continue
+
+        if (
+            isinstance(start_line, int)
+            and isinstance(end_line, int)
+            and start_line > 0
+            and end_line >= start_line
+        ):
+            normalized.append((start_line, end_line))
+
+    return sorted(set(normalized))
+
+
+def _truncate_to_changed_hunks(content, changed_hunks, max_chars):
+    """Keep complete new-file hunks when possible, then a single oversized hunk.
+
+    Hunks are considered in source order and remain separate selections.  If a
+    hunk fits within the total limit but not the remaining budget, it is
+    skipped rather than partially copied.  Partial copying is only used when
+    one hunk itself exceeds the complete budget, in which case its contiguous
+    prefix is returned.  This preserves predictable hunk-level semantics.
+    """
+    if len(content) <= max_chars:
+        return content, False
+
+    hunk_ranges = _normalize_hunks(changed_hunks)
+    if not hunk_ranges:
+        return None
+
+    lines = content.splitlines(keepends=True)
+    selected = []
+    remaining_chars = max_chars
+
+    for start_line, end_line in hunk_ranges:
+        if start_line > len(lines):
+            continue
+
+        hunk_content = "".join(lines[start_line - 1:min(end_line, len(lines))])
+        if not hunk_content:
+            continue
+
+        if len(hunk_content) <= remaining_chars:
+            selected.append(hunk_content)
+            remaining_chars -= len(hunk_content)
+            continue
+
+        if len(hunk_content) > max_chars and not selected:
+            return hunk_content[:max_chars], True
+
+    if selected:
+        return "".join(selected), True
+
+    return None
+
+
+def read_file_context(
+        repo_root,
+        file_path,
+        max_chars=4000,
+        changed_line_nos=None,
+        changed_hunks=None,
+    ):
+    """Read one file context, preferring changed hunks within the limit.
+
+    ``changed_line_nos`` remains supported for callers that have not yet
+    supplied parsed hunk ranges.
+    """
     repo_root_path = Path(repo_root).resolve()
     target_path = (repo_root_path / file_path).resolve()
 
@@ -34,23 +138,36 @@ def read_file_context(repo_root, file_path, max_chars=4000):
             file_path,
             f"File {file_path} is outside of the repository root {repo_root}"
         )
-    
+
     # 如果文件不存在，返回错误
     if not target_path.exists():
         return _error_context(file_path, f"File {file_path} does not exist")
-    
+
     # 如果是目录，返回错误
     if target_path.is_dir():
         return _error_context(file_path, f"File {file_path} is a directory")
-    
+
     # 读取文件内容，如果文件过大，只读取前max_chars个字符
     try:
         with target_path.open("r", encoding="utf-8") as f:
-            content = f.read(max_chars + 1)
+            if (changed_line_nos or changed_hunks) and max_chars > 0:
+                full_content = f.read()
+            else:
+                full_content = f.read(max_chars + 1)
 
-        truncated = len(content) > max_chars
-        if truncated:
-            content = content[:max_chars]
+        hunk_result = _truncate_to_changed_hunks(
+            full_content,
+            changed_hunks,
+            max_chars,
+        )
+        if hunk_result is not None:
+            content, truncated = hunk_result
+        else:
+            content, truncated = _truncate_to_changed_lines(
+                full_content,
+                changed_line_nos,
+                max_chars,
+            )
     except UnicodeDecodeError:
         return _error_context(file_path, f"File {file_path} is not a valid UTF-8 text file")
     except OSError as e:
@@ -68,28 +185,42 @@ def read_file_context(repo_root, file_path, max_chars=4000):
 def collect_file_contexts(
         repo_root,
         changed_files,
-        max_chars=4000,
-        max_extra_files=3
+        context_budget,
     ):
     repo_root_path=Path(repo_root).resolve()
 
     contexts = []
     seen_paths=set()
+    # The prompt builder enforces the authoritative total budget.  This cap
+    # prevents context retrieval alone from exceeding that limit first.
+    remaining_chars=context_budget.max_prompt_chars
 
-    def add_context(file_path):
+    def add_context(
+            file_path,
+            changed_line_nos=None,
+            changed_hunks=None,
+        ):
+        nonlocal remaining_chars
         if file_path in seen_paths:
-            return
+            return False
         seen_paths.add(file_path)
-        contexts.append(
-            read_file_context(
-                repo_root=repo_root,
-                file_path=file_path,
-                max_chars=max_chars,
-            )
+        context = read_file_context(
+            repo_root=repo_root,
+            file_path=file_path,
+            max_chars=remaining_chars,
+            changed_line_nos=changed_line_nos,
+            changed_hunks=changed_hunks,
         )
+        contexts.append(context)
+        remaining_chars -= context.chars_read
+        return True
 
     for changed_file in changed_files:
-        add_context(changed_file.path)
+        add_context(
+            changed_file.path,
+            changed_line_nos=[line.line_no for line in changed_file.added_lines],
+            changed_hunks=changed_file.hunks,
+        )
 
     extra_candidates=[]
 
@@ -104,7 +235,7 @@ def collect_file_contexts(
                 candidate_path.relative_to(repo_root_path)
             except ValueError:
                 continue
-            
+
             if candidate_path.exists():
                 rel_path=str(candidate_path.relative_to(repo_root_path)).replace("\\","/")
                 extra_candidates.append(rel_path)
@@ -123,17 +254,22 @@ def collect_file_contexts(
 
         try:
             with py_file.open("r", encoding="utf-8", errors="ignore") as f:
-                content=f.read(max_chars)
+                content=f.read(context_budget.max_prompt_chars)
         except OSError:
             continue
-            
+
         if any(re.search(rf"\bdef\s+{re.escape(name)}\b", content) for name in call_names):
             extra_candidates.append(rel_path)
 
+    extra_context_count=0
     for file_path in extra_candidates:
-        if len(seen_paths)>=len(changed_files) + max_extra_files:
+        if (
+            extra_context_count >= context_budget.max_extra_context_files
+            or remaining_chars == 0
+        ):
             break
-        add_context(file_path)
+        if add_context(file_path):
+            extra_context_count += 1
 
     return contexts
 

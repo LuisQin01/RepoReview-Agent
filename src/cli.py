@@ -1,4 +1,4 @@
-﻿'''
+'''
 作为命令行的入口，用来负责把用户的输入接入进来
 功能：
 1. 读取参数
@@ -14,6 +14,7 @@ from dataclasses import asdict
 from time import perf_counter
 
 from .reporter import render_json_report, render_markdown_report
+from .schemas import ContextBudget
 
 from .reviewers import review_changed_files
 from .diff_parser import parse_diff
@@ -28,10 +29,12 @@ def parse_args():
     parser.add_argument("--diff", required=True, help="Path to git diff file")
     parser.add_argument("--repo", default=".", help="Path to the repository root")
     parser.add_argument(
+        "--max-prompt-chars",
         "--max-context-chars",
+        dest="max_prompt_chars",
         type=int,
         default=4000,
-        help="Maximum number of characters to read from each file for context",
+        help="Maximum characters in the complete prompt sent to the LLM",
     )
     parser.add_argument(
         "--format",
@@ -86,9 +89,9 @@ def parse_args():
     # 检查参数合法性
     args = parser.parse_args()
     
-    # 检查 max_context_chars 是否大于0
-    if args.max_context_chars <= 0:
-        parser.error("--max-context-chars must be greater than 0")
+    # 检查 max_prompt_chars 是否大于0
+    if args.max_prompt_chars <= 0:
+        parser.error("--max-prompt-chars must be greater than 0")
 
     if args.max_extra_context_files < 0:
         parser.error("--max-extra-context-files must be greater than or equal to 0")
@@ -176,16 +179,26 @@ def run_review_agent(args):
     from .agent_state import ReviewState
     from .trace import save_trace
 
+    context_budget = getattr(args, "context_budget", None)
+    if context_budget is None:
+        context_budget = ContextBudget(
+            max_prompt_chars=getattr(
+                args,
+                "max_prompt_chars",
+                getattr(args, "max_context_chars", 4000),
+            ),
+            max_extra_context_files=args.max_extra_context_files,
+        )
+
     state = ReviewState(
         diff_path=args.diff,
         repo_root=args.repo,
         output_format=args.format,
         use_llm=args.llm,
-        max_context_chars=args.max_context_chars,
+        context_budget=context_budget,
         llm_provider=args.llm_provider,
         trace_enabled=args.trace,
         trace_dir=args.trace_dir,
-        max_extra_context_files=args.max_extra_context_files,
     )
 
     # 首先记录接收到的任务参数
@@ -237,6 +250,7 @@ def run_review_agent(args):
                 contexts=state.contexts,
                 rule_issues=state.rule_issues,
                 call_model=call_model,
+                max_prompt_chars=state.context_budget.max_prompt_chars,
             )
             state.errors.extend(validation.errors)
             state.issues.extend(state.llm_issues)

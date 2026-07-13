@@ -13,15 +13,6 @@ from .schemas import ContextBudget, DiffHunk, FileContext, PythonSymbol
 
 IGNORED_DIRS={".git", "__pycache__", ".venv", "venv", "node_modules", "traces"}
 
-def _error_context(file_path,message):
-    return FileContext(
-        path=file_path,
-        exists=False,
-        content="",
-        truncated=False,
-        chars_read=0,
-        error=message
-    )
 
 def locate_python_symbol(source, line_no):
     """Return the innermost Python symbol containing ``line_no``.
@@ -87,6 +78,19 @@ def locate_python_symbol(source, line_no):
         containing_symbols,
         key=lambda symbol: (symbol.end_line - symbol.start_line, -symbol.start_line),
     )
+
+def _error_context(file_path, message, source="", selection_reason=""):
+    return FileContext(
+        path=file_path,
+        exists=False,
+        content="",
+        truncated=False,
+        chars_read=0,
+        error=message,
+        source=source,
+        selection_reason=selection_reason,
+    )
+
 
 def _truncate_to_changed_lines(content, changed_line_nos, max_chars):
     if len(content) <= max_chars:
@@ -187,6 +191,8 @@ def read_file_context(
         max_chars=4000,
         changed_line_nos=None,
         changed_hunks=None,
+        source="",
+        selection_reason="",
     ):
     """Read one file context, preferring changed hunks within the limit.
 
@@ -202,17 +208,29 @@ def read_file_context(
     except ValueError:
         return _error_context(
             file_path,
-            f"File {file_path} is outside of the repository root {repo_root}"
+            f"File {file_path} is outside of the repository root {repo_root}",
+            source=source,
+            selection_reason=selection_reason,
         )
 
     # 如果文件不存在，返回错误
     if not target_path.exists():
-        return _error_context(file_path, f"File {file_path} does not exist")
-
+        return _error_context(
+            file_path,
+            f"File {file_path} does not exist",
+            source=source,
+            selection_reason=selection_reason,
+        )
+    
     # 如果是目录，返回错误
     if target_path.is_dir():
-        return _error_context(file_path, f"File {file_path} is a directory")
-
+        return _error_context(
+            file_path,
+            f"File {file_path} is a directory",
+            source=source,
+            selection_reason=selection_reason,
+        )
+    
     # 读取文件内容，如果文件过大，只读取前max_chars个字符
     try:
         with target_path.open("r", encoding="utf-8") as f:
@@ -235,9 +253,19 @@ def read_file_context(
                 max_chars,
             )
     except UnicodeDecodeError:
-        return _error_context(file_path, f"File {file_path} is not a valid UTF-8 text file")
+        return _error_context(
+            file_path,
+            f"File {file_path} is not a valid UTF-8 text file",
+            source=source,
+            selection_reason=selection_reason,
+        )
     except OSError as e:
-        return _error_context(file_path, f"Error reading file {file_path}: {str(e)}")
+        return _error_context(
+            file_path,
+            f"Error reading file {file_path}: {str(e)}",
+            source=source,
+            selection_reason=selection_reason,
+        )
 
     return FileContext(
         path=file_path,
@@ -246,6 +274,8 @@ def read_file_context(
         truncated=truncated,
         chars_read=len(content),
         error="",
+        source=source,
+        selection_reason=selection_reason,
     )
 
 def collect_file_contexts(
@@ -263,6 +293,8 @@ def collect_file_contexts(
 
     def add_context(
             file_path,
+            source,
+            selection_reason,
             changed_line_nos=None,
             changed_hunks=None,
         ):
@@ -276,6 +308,8 @@ def collect_file_contexts(
             max_chars=remaining_chars,
             changed_line_nos=changed_line_nos,
             changed_hunks=changed_hunks,
+            source=source,
+            selection_reason=selection_reason,
         )
         contexts.append(context)
         remaining_chars -= context.chars_read
@@ -284,6 +318,8 @@ def collect_file_contexts(
     for changed_file in changed_files:
         add_context(
             changed_file.path,
+            source="changed_file",
+            selection_reason="file is changed in the pull request",
             changed_line_nos=[line.line_no for line in changed_file.added_lines],
             changed_hunks=changed_file.hunks,
         )
@@ -301,10 +337,14 @@ def collect_file_contexts(
                 candidate_path.relative_to(repo_root_path)
             except ValueError:
                 continue
-
+            
             if candidate_path.exists():
                 rel_path=str(candidate_path.relative_to(repo_root_path)).replace("\\","/")
-                extra_candidates.append(rel_path)
+                extra_candidates.append((
+                    rel_path,
+                    "import_candidate",
+                    f"imported by selected context {context.path}",
+                ))
 
     call_names=set()
     changed_paths={changed_file.path for changed_file in changed_files}
@@ -323,18 +363,27 @@ def collect_file_contexts(
                 content=f.read(context_budget.max_prompt_chars)
         except OSError:
             continue
-
-        if any(re.search(rf"\bdef\s+{re.escape(name)}\b", content) for name in call_names):
-            extra_candidates.append(rel_path)
+            
+        matching_call_names = sorted(
+            name
+            for name in call_names
+            if re.search(rf"\bdef\s+{re.escape(name)}\b", content)
+        )
+        if matching_call_names:
+            extra_candidates.append((
+                rel_path,
+                "call_name_candidate",
+                "defines added call name(s): " + ", ".join(matching_call_names),
+            ))
 
     extra_context_count=0
-    for file_path in extra_candidates:
+    for file_path, source, selection_reason in extra_candidates:
         if (
             extra_context_count >= context_budget.max_extra_context_files
             or remaining_chars == 0
         ):
             break
-        if add_context(file_path):
+        if add_context(file_path, source, selection_reason):
             extra_context_count += 1
 
     return contexts

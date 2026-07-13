@@ -224,11 +224,22 @@ def run_review_agent(args):
     state.contexts = collect_file_contexts(
         repo_root=state.repo_root,
         changed_files=state.changed_files,
-        max_chars=state.max_context_chars,
-        max_extra_files=args.max_extra_context_files,
+        context_budget=state.context_budget,
     )
     record_step(state, "collect_context",{
         "contexts":len(state.contexts),
+        "selected_contexts":[
+            {
+                "path":context.path,
+                "source":context.source,
+                "selection_reason":context.selection_reason,
+                "exists":context.exists,
+                "truncated":context.truncated,
+                "chars_read":context.chars_read,
+                "error":context.error,
+            }
+            for context in state.contexts
+        ],
     })
 
     # 根据规则检查 changed_files，得到 rule_issues

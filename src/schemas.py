@@ -68,6 +68,8 @@ class FileContext:
     truncated: bool
     chars_read:int
     error:str=""
+    source:str=""
+    selection_reason:str=""
 
 @dataclass
 class PythonSymbol:

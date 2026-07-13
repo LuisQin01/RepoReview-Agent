@@ -56,6 +56,8 @@ def save_trace(state, trace_dir="traces"):
                 "chars_read":context.chars_read,
                 "truncated":context.truncated,
                 "error":context.error,
+                "source":context.source,
+                "selection_reason":context.selection_reason,
             }
             for context in state.contexts
         ],

@@ -257,3 +257,98 @@ def test_locate_python_symbol_returns_none_for_unlocatable_source_or_line():
     assert locate_python_symbol("def broken(:\n", 1) is None
     assert locate_python_symbol("value = 1\n", 1) is None
     assert locate_python_symbol("def valid():\n    return 1\n", 0) is None
+
+
+def test_collect_file_contexts_records_provenance_for_each_selection_path(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text(
+        "from helper import imported_value\ncall_target()\n",
+        encoding="utf-8",
+    )
+    (repo / "helper.py").write_text("imported_value = 1\n", encoding="utf-8")
+    (repo / "services.py").write_text(
+        "def call_target():\n    return True\n",
+        encoding="utf-8",
+    )
+    changed_file = ChangedFile(
+        path="app.py",
+        added_lines=[
+            DiffLine("app.py", 1, "from helper import imported_value"),
+            DiffLine("app.py", 2, "call_target()"),
+        ],
+        deleted_lines=[],
+        patch="",
+    )
+
+    contexts = collect_file_contexts(
+        repo,
+        [changed_file],
+        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=2),
+    )
+
+    provenance = {
+        context.path: (context.source, context.selection_reason)
+        for context in contexts
+    }
+    assert provenance == {
+        "app.py": ("changed_file", "file is changed in the pull request"),
+        "helper.py": ("import_candidate", "imported by selected context app.py"),
+        "services.py": ("call_name_candidate", "defines added call name(s): call_target"),
+    }
+
+
+def test_collect_file_contexts_keeps_the_first_provenance_for_a_duplicate_candidate(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text(
+        "from helper import helper\nhelper()\n",
+        encoding="utf-8",
+    )
+    (repo / "helper.py").write_text(
+        "def helper():\n    return True\n",
+        encoding="utf-8",
+    )
+    changed_file = ChangedFile(
+        path="app.py",
+        added_lines=[
+            DiffLine("app.py", 1, "from helper import helper"),
+            DiffLine("app.py", 2, "helper()"),
+        ],
+        deleted_lines=[],
+        patch="",
+    )
+
+    contexts = collect_file_contexts(
+        repo,
+        [changed_file],
+        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=1),
+    )
+
+    assert [context.path for context in contexts] == ["app.py", "helper.py"]
+    assert contexts[1].source == "import_candidate"
+    assert contexts[1].selection_reason == "imported by selected context app.py"
+
+
+def test_collect_file_contexts_keeps_provenance_when_selected_file_cannot_be_read(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    changed_file = ChangedFile(
+        path="missing.py",
+        added_lines=[],
+        deleted_lines=[],
+        patch="",
+    )
+
+    contexts = collect_file_contexts(
+        repo,
+        [changed_file],
+        context_budget=ContextBudget(max_prompt_chars=4000, max_extra_context_files=0),
+    )
+
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.exists is False
+    assert context.source == "changed_file"
+    assert context.selection_reason == "file is changed in the pull request"
+    assert "does not exist" in context.error

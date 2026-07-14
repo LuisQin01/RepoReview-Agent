@@ -24,6 +24,12 @@ def test_mock_retryable_failures_recover_with_exponential_backoff():
 
     assert '"findings"' in response
     assert delays == [0.5, 1.0]
+    assert call_model.last_retry_info == {
+        "attempts": 3,
+        "retries": 2,
+        "retry_errors": ["mock_timeout", "mock_timeout"],
+        "exhausted": False,
+    }
 
 
 def test_retryable_failure_raises_after_limited_attempts():
@@ -40,6 +46,12 @@ def test_retryable_failure_raises_after_limited_attempts():
         call_model("review this diff")
 
     assert delays == [0.25, 0.5]
+    assert call_model.last_retry_info == {
+        "attempts": 3,
+        "retries": 2,
+        "retry_errors": ["mock_timeout", "mock_timeout", "mock_timeout"],
+        "exhausted": True,
+    }
 
 
 def test_configuration_error_is_not_retried(monkeypatch):

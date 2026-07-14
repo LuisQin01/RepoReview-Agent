@@ -189,6 +189,10 @@ def test_cli_mock_llm_timeout_is_recorded_without_an_llm_finding(tmp_path):
         "provider": "mock",
         "findings": 0,
         "error": "mock_timeout",
+        "attempts": 3,
+        "retries": 2,
+        "retry_errors": ["mock_timeout", "mock_timeout", "mock_timeout"],
+        "exhausted": True,
     }
     assert not any(finding["source"] == "llm" for finding in findings)
 
@@ -265,6 +269,10 @@ def test_cli_retries_mock_timeout_then_publishes_recovered_llm_finding(tmp_path)
     findings = json.loads(output)["findings"]
 
     assert llm_step["detail"]["valid"] is True
+    assert llm_step["detail"]["attempts"] == 3
+    assert llm_step["detail"]["retries"] == 2
+    assert llm_step["detail"]["retry_errors"] == ["mock_timeout", "mock_timeout"]
+    assert llm_step["detail"]["exhausted"] is False
     assert any(finding["source"] == "llm" for finding in findings)
 
 

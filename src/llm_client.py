@@ -121,18 +121,33 @@ def call_with_retries(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS,
     sleep=time.sleep,
+    retry_info=None,
 ) -> str:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     if retry_base_delay_seconds < 0:
         raise ValueError("retry_base_delay_seconds must be non-negative")
 
+    if retry_info is None:
+        retry_info = {}
+    retry_info.clear()
+    retry_info.update(
+        attempts=0,
+        retries=0,
+        retry_errors=[],
+        exhausted=False,
+    )
+
     for attempt in range(max_attempts):
+        retry_info["attempts"] = attempt + 1
         try:
             return call_model(prompt)
-        except LLMRetryableError:
+        except LLMRetryableError as exc:
+            retry_info["retry_errors"].append(str(exc))
             if attempt == max_attempts - 1:
+                retry_info["exhausted"] = True
                 raise
+            retry_info["retries"] += 1
             sleep(retry_base_delay_seconds * (2**attempt))
 
     raise RuntimeError("unreachable")
@@ -154,10 +169,24 @@ def get_call_model(
     else:
         raise LLMConfigurationError(f"unsupported_llm_provider:{provider}")
 
-    return partial(
-        call_with_retries,
-        call_model,
-        max_attempts=max_attempts,
-        retry_base_delay_seconds=retry_base_delay_seconds,
-        sleep=sleep,
-    )
+    def call_model_with_retries(prompt: str) -> str:
+        retry_info = {}
+        try:
+            return call_with_retries(
+                call_model,
+                prompt,
+                max_attempts=max_attempts,
+                retry_base_delay_seconds=retry_base_delay_seconds,
+                sleep=sleep,
+                retry_info=retry_info,
+            )
+        finally:
+            call_model_with_retries.last_retry_info = retry_info
+
+    call_model_with_retries.last_retry_info = {
+        "attempts": 0,
+        "retries": 0,
+        "retry_errors": [],
+        "exhausted": False,
+    }
+    return call_model_with_retries

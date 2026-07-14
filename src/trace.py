@@ -29,7 +29,7 @@ def _llm_called(steps):
         for step in steps
     )
 
-def save_trace(state, trace_dir="traces"):
+def save_trace(state, trace_dir="traces", final_step=None):
     trace_root=Path(trace_dir)
     trace_root.mkdir(parents=True, exist_ok=True)
 
@@ -72,6 +72,22 @@ def save_trace(state, trace_dir="traces"):
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    if final_step is not None:
+        state.trace_steps.append(
+            {
+                "step": final_step["step"],
+                "duration_ms": int(
+                    (perf_counter() - final_step["started_at_perf"]) * 1000
+                ),
+                "detail": final_step.get("detail", {}),
+            }
+        )
+        payload["steps"] = state.trace_steps
+        trace_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     state.trace_path=str(trace_path)
     return trace_path

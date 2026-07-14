@@ -56,6 +56,8 @@ class ReviewIssue:
     evidence:str=""
     # System-assigned provenance: "rule" or "llm". Never accept it from LLM output.
     source:str=""
+    # System-assigned publication target: "inline" or "summary". Never accept it from LLM output.
+    placement:str="inline"
 
 @dataclass
 class FileContext:

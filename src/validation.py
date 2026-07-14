@@ -16,10 +16,11 @@ class ValidationResult:
 
 
 def validate_issue_locations(issues, changed_files):
-    """Keep only findings that can be published against changed hunks.
+    """Assign each finding to inline or summary publication.
 
-    Repository-level rule findings are intentionally retained because they are
-    not inline findings and are produced by trusted deterministic rules.
+    Only findings mapped to changed hunks can be inline. Repository-level
+    findings and findings without a safe changed-hunk location stay in the
+    result as summary-only findings.
     """
     hunks_by_path = {}
     for changed_file in changed_files:
@@ -32,6 +33,7 @@ def validate_issue_locations(issues, changed_files):
             and getattr(issue, "file_path", None) == "(repository)"
             and getattr(issue, "line_no", None) == 0
         ):
+            issue.placement = "summary"
             validated_issues.append(issue)
             continue
 
@@ -42,12 +44,24 @@ def validate_issue_locations(issues, changed_files):
             or isinstance(line_no, bool)
             or not isinstance(line_no, int)
         ):
+            # Summary rendering must not receive an untrusted path or line
+            # value that could be mistaken for an inline location.
+            issue.placement = "summary"
+            if not isinstance(file_path, str):
+                issue.file_path = "(unlocatable)"
+            if isinstance(line_no, bool) or not isinstance(line_no, int):
+                issue.line_no = 0
+            validated_issues.append(issue)
             continue
 
         if any(
             hunk.start_line <= line_no <= hunk.end_line
             for hunk in hunks_by_path.get(file_path, [])
         ):
+            issue.placement = "inline"
+            validated_issues.append(issue)
+        else:
+            issue.placement = "summary"
             validated_issues.append(issue)
 
     return validated_issues

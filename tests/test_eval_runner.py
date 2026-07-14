@@ -1,9 +1,11 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from src import eval_runner
-from src.schemas import ContextBudget
+from src.review_service import ReviewRequest
+from src.schemas import ContextBudget, ReviewIssue
 
 
 def make_case(tmp_path, *, expected_categories, should_find):
@@ -20,6 +22,19 @@ def make_case(tmp_path, *, expected_categories, should_find):
         encoding="utf-8",
     )
     return case_dir
+
+
+def install_review_service(monkeypatch, findings):
+    requests = []
+
+    class FakeReviewService:
+        def review(self, request):
+            assert isinstance(request, ReviewRequest)
+            requests.append(request)
+            return SimpleNamespace(state=SimpleNamespace(issues=findings))
+
+    monkeypatch.setattr(eval_runner, "ReviewService", FakeReviewService)
+    return requests
 
 
 def test_extract_categories_prefers_category_and_falls_back_to_reason():
@@ -44,8 +59,10 @@ def test_run_one_case_requires_exact_categories_for_positive_cases(
     tmp_path, monkeypatch, categories, expected_passed, expected_false_positive, expected_counts
 ):
     case_dir = make_case(tmp_path, expected_categories=["secret"], should_find=True)
-    output = json.dumps({"findings": [{"category": category} for category in categories]})
-    monkeypatch.setattr(eval_runner, "run_review_agent", lambda args: (output, []))
+    install_review_service(
+        monkeypatch,
+        [ReviewIssue("app.py", 1, "warning", category, "issue", "fix") for category in categories],
+    )
 
     result = eval_runner.run_one_case(case_dir, tmp_path)
 
@@ -59,11 +76,7 @@ def test_run_one_case_marks_findings_in_no_find_case_as_false_positive(
     tmp_path, monkeypatch
 ):
     case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
-    monkeypatch.setattr(
-        eval_runner,
-        "run_review_agent",
-        lambda args: (json.dumps({"findings": [{"issue": "unexpected"}]}), []),
-    )
+    install_review_service(monkeypatch, [{"issue": "unexpected"}])
 
     result = eval_runner.run_one_case(case_dir, tmp_path)
 
@@ -77,10 +90,11 @@ def test_run_one_case_marks_findings_in_no_find_case_as_false_positive(
 def test_run_one_case_marks_runner_failure_as_not_passed(tmp_path, monkeypatch):
     case_dir = make_case(tmp_path, expected_categories=["secret"], should_find=True)
 
-    def fail_review(args):
-        raise RuntimeError("review failed")
+    class FailingReviewService:
+        def review(self, request):
+            raise RuntimeError("review failed")
 
-    monkeypatch.setattr(eval_runner, "run_review_agent", fail_review)
+    monkeypatch.setattr(eval_runner, "ReviewService", FailingReviewService)
 
     result = eval_runner.run_one_case(case_dir, tmp_path)
 
@@ -95,13 +109,14 @@ def test_run_one_case_passes_context_budget_to_review_agent(tmp_path, monkeypatc
     case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
     budget = ContextBudget(max_prompt_chars=17, max_extra_context_files=0)
 
-    def fake_review(args):
-        assert args.context_budget is budget
-        assert args.max_prompt_chars == 17
-        assert args.max_extra_context_files == 0
-        return json.dumps({"findings": []}), []
+    class FakeReviewService:
+        def review(self, request):
+            assert request.context_budget is budget
+            assert request.context_budget.max_prompt_chars == 17
+            assert request.context_budget.max_extra_context_files == 0
+            return SimpleNamespace(state=SimpleNamespace(issues=[]))
 
-    monkeypatch.setattr(eval_runner, "run_review_agent", fake_review)
+    monkeypatch.setattr(eval_runner, "ReviewService", FakeReviewService)
 
     result = eval_runner.run_one_case(case_dir, tmp_path, context_budget=budget)
 
@@ -110,19 +125,17 @@ def test_run_one_case_passes_context_budget_to_review_agent(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("payload", "error_fragment"),
+    ("findings", "error_fragment"),
     [
-        (json.dumps({}), "missing required 'findings' field"),
-        (json.dumps(["not", "an", "object"]), "top-level must be an object"),
-        (json.dumps({"findings": "not-a-list"}), "'findings' must be a list"),
-        (json.dumps({"findings": [None]}), "'findings[0]' must be an object"),
+        (None, "issues must be a list"),
+        ([None], "issues[0] must be a finding object"),
     ],
 )
 def test_run_one_case_degrades_on_malformed_reviewer_output(
-    tmp_path, monkeypatch, payload, error_fragment
+    tmp_path, monkeypatch, findings, error_fragment
 ):
     case_dir = make_case(tmp_path, expected_categories=["secret"], should_find=True)
-    monkeypatch.setattr(eval_runner, "run_review_agent", lambda args: (payload, []))
+    install_review_service(monkeypatch, findings)
 
     result = eval_runner.run_one_case(case_dir, tmp_path)
 

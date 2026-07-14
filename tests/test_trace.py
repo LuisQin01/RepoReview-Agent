@@ -1,9 +1,10 @@
 import json
 from types import SimpleNamespace
 
-from src import cli
 from src.cli import run_review_agent
 from src.llm_client import LLMRetryableError
+from src import review_service
+from src.review_service import record_step
 
 
 def _make_trace_args(tmp_path):
@@ -38,10 +39,10 @@ def _make_trace_args(tmp_path):
 def test_record_step_uses_its_own_start_time_and_allows_zero_duration(monkeypatch):
     state = SimpleNamespace(trace_steps=[])
     timestamps = iter([10.0, 10.125])
-    monkeypatch.setattr(cli, "perf_counter", lambda: next(timestamps))
+    monkeypatch.setattr(review_service, "perf_counter", lambda: next(timestamps))
 
-    cli.record_step(state, "zero", started_at_perf=10.0)
-    cli.record_step(state, "later", started_at_perf=10.0)
+    record_step(state, "zero", started_at_perf=10.0)
+    record_step(state, "later", started_at_perf=10.0)
 
     assert [step["duration_ms"] for step in state.trace_steps] == [0, 125]
 
@@ -87,7 +88,9 @@ def test_saved_trace_redacts_retry_errors_and_keeps_retry_metadata(tmp_path, mon
         ],
         "exhausted": True,
     }
-    monkeypatch.setattr(cli, "get_call_model", lambda *_args, **_kwargs: failing_call_model)
+    monkeypatch.setattr(
+        review_service, "get_call_model", lambda *_args, **_kwargs: failing_call_model
+    )
     args = _make_trace_args(tmp_path)
     args.llm = True
 

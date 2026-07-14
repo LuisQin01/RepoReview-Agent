@@ -16,6 +16,25 @@ Run the test suite without calling the OpenAI API:
 py -m pytest tests/ -v
 ```
 
+## Minimal HTTP API
+
+`POST /reviews` runs one stateless, rule-based review. The API accepts an
+inline diff only; its repository root is configured by the server process, so
+clients cannot request arbitrary local files, enable LLM calls, or publish to
+GitHub through this endpoint.
+
+```powershell
+py -m uvicorn src.api:app --host 127.0.0.1 --port 8000
+```
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/reviews -ContentType 'application/json' -Body (@{ diff = (Get-Content .\examples\simple.diff -Raw) } | ConvertTo-Json)
+```
+
+The response contains redacted structured findings, run errors, step timing,
+and summary metrics. It does not persist review runs or expose follow-up
+query endpoints.
+
 ## GitHub PR summary publishing
 
 Summary publishing is opt-in. The default CLI flow only writes the local

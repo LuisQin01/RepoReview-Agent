@@ -1,8 +1,8 @@
 '''
 1. 读取 evals/cases 下的每个 case 目录
 2. 每个 case 读取 input.diff 和 expected.json
-3. 构造 args，调用已有的 run_review_agent(args)
-4. 解析 review 输出里的 findings
+3. 构造 ReviewRequest，调用 ReviewService
+4. 从结构化 ReviewResult 中读取 findings
 5. 提取实际命中的 category
 6. 和 expected_categories 对比
 7. 汇总输出指标
@@ -11,12 +11,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from types import SimpleNamespace
 from time import perf_counter
 
-from .cli import run_review_agent
+import json
+
+from .review_service import ReviewRequest, ReviewService
 from .schemas import ContextBudget
 
 def load_expected(case_dir: Path):
@@ -26,7 +26,12 @@ def load_expected(case_dir: Path):
 def extract_categories(findings):
     categories = set()
     for finding in findings:
-        category = finding.get("category") or finding.get("reason")
+        if isinstance(finding, dict):
+            category = finding.get("category") or finding.get("reason")
+        else:
+            category = getattr(finding, "category", None) or getattr(
+                finding, "reason", None
+            )
         if category:
             categories.add(category)
     return categories
@@ -54,47 +59,42 @@ def run_one_case(
     expected = load_expected(case_dir)
     context_budget = context_budget or ContextBudget()
 
-    args=SimpleNamespace(
-        diff=str(case_dir / "input.diff"),
-        repo=str(repo_root),
-        max_prompt_chars=context_budget.max_prompt_chars,
-        format="json",
-        output=None,
-        llm=use_llm,
-        llm_provider=llm_provider,
-        trace=False,
-        trace_dir="traces",
-        max_extra_context_files=context_budget.max_extra_context_files,
+    request = ReviewRequest(
+        diff_path=str(case_dir / "input.diff"),
+        repo_root=str(repo_root),
+        output_format="json",
+        use_llm=use_llm,
         context_budget=context_budget,
+        llm_provider=llm_provider,
+        trace_enabled=False,
     )
 
     started=perf_counter()
 
     try:
-        output, trace_steps=run_review_agent(args)
+        result = ReviewService().review(request)
         duration_ms=int((perf_counter() - started) * 1000)
 
-        data=json.loads(output)
-        if not isinstance(data, dict):
-            raise ValueError(
-                f"reviewer JSON top-level must be an object, got {type(data).__name__}"
-            )
-        if "findings" not in data:
-            raise ValueError("reviewer JSON is missing required 'findings' field")
-        findings=data["findings"]
+        state = getattr(result, "state", None)
+        findings = getattr(state, "issues", None)
         if not isinstance(findings, list):
             raise ValueError(
-                f"reviewer JSON 'findings' must be a list, got {type(findings).__name__}"
+                "review result issues must be a list, got "
+                f"{type(findings).__name__}"
             )
         invalid_finding_index = next(
-            (index for index, finding in enumerate(findings) if not isinstance(finding, dict)),
+            (
+                index
+                for index, finding in enumerate(findings)
+                if not isinstance(finding, dict) and not hasattr(finding, "category")
+            ),
             None,
         )
         if invalid_finding_index is not None:
             invalid_finding = findings[invalid_finding_index]
             raise ValueError(
-                "reviewer JSON "
-                f"'findings[{invalid_finding_index}]' must be an object, "
+                "review result "
+                f"issues[{invalid_finding_index}] must be a finding object, "
                 f"got {type(invalid_finding).__name__}"
             )
         json_valid=True

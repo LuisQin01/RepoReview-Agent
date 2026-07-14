@@ -15,20 +15,8 @@ from time import perf_counter
 
 from .git_provider import parse_pull_request_ref
 from .github_provider import GitHubPRProvider
-from .reporter import (
-    render_json_report,
-    render_markdown_report,
-    render_summary_comment,
-)
 from .schemas import ContextBudget
-
-from .reviewers import review_changed_files
-from .diff_parser import parse_diff
-from .file_context import collect_file_contexts
-from .llm_reviewer import review_with_llm
-from .llm_client import get_call_model, LLMClientError
-from .trace import redact_sensitive_structure, sanitize_trace_text
-from .validation import validate_issue_locations
+from .review_service import ReviewRequest, ReviewService
 
 
 def parse_args():
@@ -164,34 +152,6 @@ def print_review_input(changed_files, contexts):
     }
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
-def record_step(state, step, detail=None, started_at_perf=None):
-    if started_at_perf is None:
-        started_at_perf = perf_counter()
-    duration_ms=int((perf_counter()-started_at_perf)*1000)
-    state.trace_steps.append({
-        "step":step,
-        "duration_ms":duration_ms,
-        "detail":redact_sensitive_structure(detail or {}),
-    })
-
-
-def _retry_detail(call_model):
-    retry_info = getattr(call_model, "last_retry_info", {})
-    return {
-        "attempts": retry_info.get("attempts", 0),
-        "retries": retry_info.get("retries", 0),
-        "retry_errors": [
-            sanitize_trace_text(error)
-            for error in retry_info.get("retry_errors", [])
-        ],
-        "exhausted": retry_info.get("exhausted", False),
-    }
-
-def validate_issues(issues, changed_files):
-    if not isinstance(issues, list):
-        raise ValueError("Issues should be a list")
-    return validate_issue_locations(issues, changed_files)
-
 def mock_call_model(prompt):
     return """
 {
@@ -210,9 +170,6 @@ def mock_call_model(prompt):
 """
 
 def run_review_agent(args):
-    from .agent_state import ReviewState
-    from .trace import save_trace
-
     context_budget = getattr(args, "context_budget", None)
     if context_budget is None:
         context_budget = ContextBudget(
@@ -224,160 +181,25 @@ def run_review_agent(args):
             max_extra_context_files=args.max_extra_context_files,
         )
 
-    state = ReviewState(
+    pull_request = None
+    if getattr(args, "publish_summary_comment", False):
+        pull_request = parse_pull_request_ref(pr_url=args.pr_url)
+
+    request = ReviewRequest(
         diff_path=args.diff,
         repo_root=args.repo,
         output_format=args.format,
         use_llm=args.llm,
         context_budget=context_budget,
         llm_provider=args.llm_provider,
+        mock_fixture=getattr(args, "mock_fixture", "normal"),
         trace_enabled=args.trace,
         trace_dir=args.trace_dir,
+        publish_summary_comment=getattr(args, "publish_summary_comment", False),
+        pull_request=pull_request,
     )
-
-    # 首先记录接收到的任务参数
-    record_step(state, "receive_task",{
-        "diff":state.diff_path,
-        "repo":state.repo_root,
-        "format":state.output_format,
-        "llm":state.use_llm,
-        "llm_provider":state.llm_provider,
-    }, started_at_perf=state.started_at_perf)
-
-    # 读取 diff 文件
-    step_started_at_perf = perf_counter()
-    state.diff_text = read_diff(state.diff_path)
-
-    # 解析 diff，得到结构化的 changed_files
-    state.changed_files = parse_diff(state.diff_text)
-    # 记录解析 diff 的结果
-    record_step(state, "parse_diff",{
-        "changed_files":len(state.changed_files),
-    }, started_at_perf=step_started_at_perf)
-
-    # 收集文件上下文，diff只告诉你修改了哪些行，但没有告诉你这些行的上下文是什么样的
-    step_started_at_perf = perf_counter()
-    state.contexts = collect_file_contexts(
-        repo_root=state.repo_root,
-        changed_files=state.changed_files,
-        context_budget=state.context_budget,
-    )
-    record_step(state, "collect_context",{
-        "contexts":len(state.contexts),
-        "selected_contexts":[
-            {
-                "path":context.path,
-                "source":context.source,
-                "selection_reason":context.selection_reason,
-                "exists":context.exists,
-                "truncated":context.truncated,
-                "chars_read":context.chars_read,
-                "error":context.error,
-            }
-            for context in state.contexts
-        ],
-    }, started_at_perf=step_started_at_perf)
-
-    # 根据规则检查 changed_files，得到 rule_issues
-    step_started_at_perf = perf_counter()
-    state.rule_issues=review_changed_files(state.changed_files)
-    state.issues=list(state.rule_issues)
-    record_step(state, "run_static_checks",{
-        "findings":len(state.issues),
-    }, started_at_perf=step_started_at_perf)
-
-    if state.use_llm:
-        step_started_at_perf = perf_counter()
-        call_model = None
-        try:    
-            call_model=get_call_model(
-                state.llm_provider,
-                mock_fixture=getattr(args, "mock_fixture", "normal"),
-            )
-
-            state.llm_issues, validation = review_with_llm(
-                changed_files=state.changed_files,
-                contexts=state.contexts,
-                rule_issues=state.rule_issues,
-                call_model=call_model,
-                max_prompt_chars=state.context_budget.max_prompt_chars,
-            )
-            state.errors.extend(validation.errors)
-            state.issues.extend(state.llm_issues)
-
-            record_step(state, "run_llm_review",{
-                "called":True,
-                "provider":state.llm_provider,
-                "findings":len(state.llm_issues),
-                "valid":validation.valid,
-                "repaired":validation.repaired,
-                "errors":validation.errors,
-                **_retry_detail(call_model),
-            }, started_at_perf=step_started_at_perf)
-        except LLMClientError as exc:
-            state.errors.append(str(exc))
-            record_step(state, "run_llm_review",{
-                "called":True,
-                "provider":state.llm_provider,
-                "findings":0,
-                "error":sanitize_trace_text(exc),
-                **_retry_detail(call_model),
-            }, started_at_perf=step_started_at_perf)
-    else:
-        step_started_at_perf = perf_counter()
-        record_step(state, "run_llm_review",{
-            "called":False,
-        }, started_at_perf=step_started_at_perf)
-
-    step_started_at_perf = perf_counter()
-    state.issues = validate_issues(state.issues, state.changed_files)
-    record_step(state, "validate_output",{
-        "findings":len(state.issues),
-    }, started_at_perf=step_started_at_perf)
-
-    step_started_at_perf = perf_counter()
-    if state.output_format == "json":
-        state.output = render_json_report(state.issues)
-    else:
-        state.output = render_markdown_report(state.issues, state.changed_files, state.contexts)
-
-    record_step(state, "render_report",{
-        "format":state.output_format,
-    }, started_at_perf=step_started_at_perf)
-
-    if getattr(args, "publish_summary_comment", False):
-        step_started_at_perf = perf_counter()
-        reference = parse_pull_request_ref(pr_url=getattr(args, "pr_url", None))
-        summary_body = render_summary_comment(state.issues, state.changed_files)
-        result = GitHubPRProvider().publish_summary_comment(reference, summary_body)
-        record_step(
-            state,
-            "publish_summary_comment",
-            {"action": result.action, "comment_id": result.comment_id},
-            started_at_perf=step_started_at_perf,
-        )
-
-    if state.trace_enabled:
-        save_started_at_perf = perf_counter()
-        save_trace(
-            state,
-            state.trace_dir,
-            final_step={
-                "step": "save_trace",
-                "detail": {
-                    "enabled": True,
-                    "trace_dir": state.trace_dir,
-                },
-                "started_at_perf": save_started_at_perf,
-            },
-        )
-    else:
-        step_started_at_perf = perf_counter()
-        record_step(state, "save_trace",{
-            "enabled":False,
-        }, started_at_perf=step_started_at_perf)
-
-    return state.output, state.trace_steps
+    result = ReviewService(git_provider_factory=GitHubPRProvider).review(request)
+    return result.output, result.trace_steps
 
 def main():
     args = parse_args()

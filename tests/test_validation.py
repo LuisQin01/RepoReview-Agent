@@ -31,9 +31,10 @@ def test_validate_issue_locations_keeps_changed_hunk_boundaries_and_repository_r
     validated = validate_issue_locations(issues, changed_files)
 
     assert validated == issues
+    assert [issue.placement for issue in validated] == ["inline", "inline", "inline", "summary"]
 
 
-def test_validate_issue_locations_drops_out_of_scope_or_unlocatable_findings():
+def test_validate_issue_locations_downgrades_out_of_scope_or_unlocatable_findings_to_summary():
     changed_files = [
         ChangedFile(
             path="src/app.py",
@@ -54,7 +55,11 @@ def test_validate_issue_locations_drops_out_of_scope_or_unlocatable_findings():
 
     validated = validate_issue_locations([valid_issue, *invalid_issues], changed_files)
 
-    assert validated == [valid_issue]
+    assert validated == [valid_issue, *invalid_issues]
+    assert valid_issue.placement == "inline"
+    assert [issue.placement for issue in invalid_issues] == ["summary"] * len(invalid_issues)
+    assert invalid_issues[3].file_path == "(unlocatable)"
+    assert invalid_issues[4].line_no == 0
 
 
 def test_bad_json_returns_error_not_exception():

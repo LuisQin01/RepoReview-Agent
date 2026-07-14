@@ -41,6 +41,7 @@ def issue_to_finding(issue):
         "confidence":issue.confidence,
         "evidence":redact_sensitive_values(issue.evidence),
         "source":issue.source,
+        "placement":issue.placement,
     }
 
 def render_json_report(issues):
@@ -208,8 +209,8 @@ def render_summary_comment(issues, changed_files):
         return "\n".join(lines)
 
     lines.extend([
-        "| Severity | File | Line | Category | Issue |",
-        "| --- | --- | ---: | --- | --- |",
+        "| Severity | File | Line | Placement | Category | Issue |",
+        "| --- | --- | ---: | --- | --- | --- |",
     ])
     for issue in sorted(
         issues,
@@ -226,7 +227,8 @@ def render_summary_comment(issues, changed_files):
                 [
                     _escape_table_cell(issue.severity),
                     _escape_table_cell(redact_sensitive_values(issue.file_path)),
-                    str(issue.line_no),
+                    str(issue.line_no) if issue.placement == "inline" else "summary only",
+                    _escape_table_cell(issue.placement),
                     _escape_table_cell(redact_sensitive_values(issue.category)),
                     _escape_table_cell(redact_sensitive_values(issue.message)),
                 ]

@@ -37,6 +37,24 @@ def test_render_summary_comment_is_marked_compact_and_sorted():
     assert "token\\|with<br>newline" in summary
 
 
+def test_render_summary_comment_marks_downgraded_finding_as_summary_only():
+    issue = ReviewIssue(
+        file_path="app.py",
+        line_no=99,
+        severity="warning",
+        category="llm",
+        message="line is outside the changed hunk",
+        suggestion="fix it",
+        source="llm",
+        placement="summary",
+    )
+
+    summary = render_summary_comment([issue], [ChangedFile("app.py", [], [], "")])
+
+    assert "| warning | app.py | summary only | summary | llm | line is outside the changed hunk |" in summary
+    assert "| warning | app.py | 99" not in summary
+
+
 def test_render_summary_comment_handles_no_findings():
     summary = render_summary_comment([], [])
 

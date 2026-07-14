@@ -76,7 +76,7 @@ def install_summary_renderer(monkeypatch):
         assert changed_files
         return body
 
-    monkeypatch.setattr("src.cli.render_summary_comment", render)
+    monkeypatch.setattr("src.review_service.render_summary_comment", render)
     return body
 
 
@@ -512,7 +512,7 @@ def test_cli_retries_mock_timeout_then_publishes_recovered_llm_finding(tmp_path)
     assert any(finding["source"] == "llm" for finding in findings)
 
 
-def test_cli_does_not_publish_llm_findings_outside_changed_hunks(tmp_path, monkeypatch):
+def test_cli_downgrades_unlocatable_llm_findings_and_publishes_them_in_summary(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "app.py").write_text("new_value = 1\n", encoding="utf-8")
@@ -561,9 +561,26 @@ def test_cli_does_not_publish_llm_findings_outside_changed_hunks(tmp_path, monke
         ]
     }
     monkeypatch.setattr(
-        "src.cli.get_call_model",
+        "src.review_service.get_call_model",
         lambda *_args, **_kwargs: lambda _prompt: json.dumps(response),
     )
+    comments_url = "https://api.github.com/repos/acme/reviewed-repo/issues/42/comments"
+    requests = []
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            return SummaryHttpResponse("[]")
+
+        assert request.method == "POST"
+        assert request.full_url == comments_url
+        summary_body = json.loads(request.data.decode("utf-8"))["body"]
+        assert "| info | app.py | 1 | inline | llm | valid |" in summary_body
+        assert "| info | app.py | summary only | summary | llm | wrong line |" in summary_body
+        assert "| info | other.py | summary only | summary | llm | wrong file |" in summary_body
+        return SummaryHttpResponse(json.dumps({"id": 73}))
+
+    install_summary_provider(monkeypatch, http_open)
     args = SimpleNamespace(
         diff=str(diff_file),
         repo=str(repo),
@@ -575,12 +592,17 @@ def test_cli_does_not_publish_llm_findings_outside_changed_hunks(tmp_path, monke
         trace=False,
         trace_dir=str(tmp_path / "traces"),
         max_extra_context_files=0,
+        publish_summary_comment=True,
+        pr_url="https://github.com/acme/reviewed-repo/pull/42",
     )
 
     output, trace_steps = run_review_agent(args)
 
     findings = json.loads(output)["findings"]
-    assert [finding["issue"] for finding in findings if finding["source"] == "llm"] == ["valid"]
+    llm_findings = [finding for finding in findings if finding["source"] == "llm"]
+    assert [finding["issue"] for finding in llm_findings] == ["valid", "wrong line", "wrong file"]
+    assert [finding["placement"] for finding in llm_findings] == ["inline", "summary", "summary"]
+    assert [request.method for request in requests] == ["GET", "POST"]
     validate_step = next(step for step in trace_steps if step["step"] == "validate_output")
     assert validate_step["detail"]["findings"] == len(findings)
 
@@ -677,7 +699,7 @@ def test_cli_redacts_secret_values_in_published_summary_body(tmp_path, monkeypat
             ),
         ]
 
-    monkeypatch.setattr("src.cli.review_changed_files", fake_review)
+    monkeypatch.setattr("src.review_service.review_changed_files", fake_review)
 
     requests = []
 

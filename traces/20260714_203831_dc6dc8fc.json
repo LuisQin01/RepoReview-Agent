@@ -1,0 +1,126 @@
+{
+  "task_id": "dc6dc8fc",
+  "steps": [
+    {
+      "step": "receive_task",
+      "duration_ms": 0,
+      "detail": {
+        "diff": "examples\\simple.diff",
+        "repo": ".",
+        "format": "markdown",
+        "llm": false,
+        "llm_provider": "mock"
+      }
+    },
+    {
+      "step": "parse_diff",
+      "duration_ms": 4,
+      "detail": {
+        "changed_files": 1
+      }
+    },
+    {
+      "step": "collect_context",
+      "duration_ms": 282,
+      "detail": {
+        "contexts": 2,
+        "selected_contexts": [
+          {
+            "path": "app.py",
+            "source": "changed_file",
+            "selection_reason": "file is changed in the pull request",
+            "exists": false,
+            "truncated": false,
+            "chars_read": 0,
+            "error": "File app.py does not exist"
+          },
+          {
+            "path": "tests/test_cli_smoke.py",
+            "source": "call_name_candidate",
+            "selection_reason": "defines added call name(s): read",
+            "exists": true,
+            "truncated": true,
+            "chars_read": 4000,
+            "error": ""
+          }
+        ]
+      }
+    },
+    {
+      "step": "run_static_checks",
+      "duration_ms": 1,
+      "detail": {
+        "findings": 10
+      }
+    },
+    {
+      "step": "run_llm_review",
+      "duration_ms": 0,
+      "detail": {
+        "called": false
+      }
+    },
+    {
+      "step": "validate_output",
+      "duration_ms": 0,
+      "detail": {
+        "findings": 10
+      }
+    },
+    {
+      "step": "render_report",
+      "duration_ms": 1,
+      "detail": {
+        "format": "markdown"
+      }
+    },
+    {
+      "step": "publish_summary_comment",
+      "duration_ms": 20085,
+      "detail": {
+        "action": "updated",
+        "comment_id": 4969221332
+      }
+    },
+    {
+      "step": "save_trace",
+      "duration_ms": 2,
+      "detail": {
+        "enabled": true,
+        "trace_dir": "traces"
+      }
+    }
+  ],
+  "input_files": [
+    {
+      "path": "app.py",
+      "added_lines": 6,
+      "deleted_lines": 1
+    }
+  ],
+  "context_files": [
+    {
+      "path": "app.py",
+      "exists": false,
+      "chars_read": 0,
+      "truncated": false,
+      "error": "File app.py does not exist",
+      "source": "changed_file",
+      "selection_reason": "file is changed in the pull request"
+    },
+    {
+      "path": "tests/test_cli_smoke.py",
+      "exists": true,
+      "chars_read": 4000,
+      "truncated": true,
+      "error": "",
+      "source": "call_name_candidate",
+      "selection_reason": "defines added call name(s): read"
+    }
+  ],
+  "llm_called": false,
+  "llm_provider": "mock",
+  "findings_count": 10,
+  "duration_ms": 20375,
+  "errors": []
+}

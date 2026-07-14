@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from src import cli
 from src.cli import run_review_agent
+from src.llm_client import LLMRetryableError
 
 
 def _make_trace_args(tmp_path):
@@ -64,3 +65,40 @@ def test_saved_trace_records_duration_for_every_step_including_final_save(tmp_pa
     assert all(isinstance(step["duration_ms"], int) for step in saved_steps)
     assert all(step["duration_ms"] >= 0 for step in saved_steps)
     assert saved_steps[-1]["detail"]["enabled"] is True
+
+
+def test_saved_trace_redacts_retry_errors_and_keeps_retry_metadata(tmp_path, monkeypatch):
+    secret = "super-secret-token"
+
+    def failing_call_model(_prompt):
+        raise LLMRetryableError(f"Authorization: Bearer {secret}; api_key={secret}")
+
+    failing_call_model.last_retry_info = {
+        "attempts": 3,
+        "retries": 2,
+        "retry_errors": [
+            f"Authorization: Bearer {secret}; api_key={secret}",
+            "x" * 400,
+            f"token={secret}",
+            (
+                f'provider response {{"api_key": "{secret}", '
+                f'"token": "{secret}", "password": "{secret}"}}'
+            ),
+        ],
+        "exhausted": True,
+    }
+    monkeypatch.setattr(cli, "get_call_model", lambda *_args, **_kwargs: failing_call_model)
+    args = _make_trace_args(tmp_path)
+    args.llm = True
+
+    _, trace_steps = run_review_agent(args)
+    trace_path = next((tmp_path / "traces").glob("*.json"))
+    trace_text = trace_path.read_text(encoding="utf-8")
+    llm_step = next(step for step in trace_steps if step["step"] == "run_llm_review")
+
+    assert secret not in trace_text
+    assert llm_step["detail"]["attempts"] == 3
+    assert llm_step["detail"]["retries"] == 2
+    assert llm_step["detail"]["exhausted"] is True
+    assert all(len(error) <= 303 for error in llm_step["detail"]["retry_errors"])
+    assert "[REDACTED]" in llm_step["detail"]["retry_errors"][0]

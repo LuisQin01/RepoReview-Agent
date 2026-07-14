@@ -11,13 +11,25 @@
 '''
 
 import json
+import re
 
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
-def _short_text(value, max_chars=300):
+_SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
+    re.compile(
+        r"(?i)((?:api[_-]?key|access[_-]?token|token|secret|password)\s*"
+        r"(?:['\"]\s*)?[=:]\s*)(?:['\"])?[^\s,'\";}\]]+"
+    ),
+)
+
+
+def sanitize_trace_text(value, max_chars=300):
     text=str(value)
+    for pattern in _SENSITIVE_VALUE_PATTERNS:
+        text = pattern.sub(r"\1[REDACTED]", text)
     if len(text)<=max_chars:
         return text
     return text[:max_chars]+"..."
@@ -65,7 +77,7 @@ def save_trace(state, trace_dir="traces", final_step=None):
         "llm_provider": state.llm_provider,
         "findings_count": len(state.issues),
         "duration_ms": duration_ms,
-        "errors": [_short_text(error) for error in state.errors],
+        "errors": [sanitize_trace_text(error) for error in state.errors],
     }
 
     trace_path.write_text(

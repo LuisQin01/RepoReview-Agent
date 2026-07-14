@@ -21,6 +21,7 @@ from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
 from .llm_reviewer import review_with_llm
 from .llm_client import get_call_model, LLMClientError
+from .trace import sanitize_trace_text
 from .validation import validate_issue_locations
 
 
@@ -162,7 +163,10 @@ def _retry_detail(call_model):
     return {
         "attempts": retry_info.get("attempts", 0),
         "retries": retry_info.get("retries", 0),
-        "retry_errors": retry_info.get("retry_errors", []),
+        "retry_errors": [
+            sanitize_trace_text(error)
+            for error in retry_info.get("retry_errors", [])
+        ],
         "exhausted": retry_info.get("exhausted", False),
     }
 
@@ -299,7 +303,7 @@ def run_review_agent(args):
                 "called":True,
                 "provider":state.llm_provider,
                 "findings":0,
-                "error":str(exc),
+                "error":sanitize_trace_text(exc),
                 **_retry_detail(call_model),
             }, started_at_perf=step_started_at_perf)
     else:

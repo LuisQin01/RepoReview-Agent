@@ -16,6 +16,24 @@ Run the test suite without calling the OpenAI API:
 py -m pytest tests/ -v
 ```
 
+## GitHub PR summary publishing
+
+Summary publishing is opt-in. The default CLI flow only writes the local
+report and does not make GitHub requests. To publish the validated summary to
+a GitHub pull request, set the token and the bot login in the environment,
+then provide both flags:
+
+```powershell
+$env:GITHUB_TOKEN = "<token>"
+$env:GITHUB_SUMMARY_COMMENT_AUTHOR_LOGIN = "reporeview-bot"
+py -m src.cli --diff path\to\changes.diff --repo . --publish-summary-comment --pr-url https://github.com/OWNER/REPO/pull/123
+```
+
+The configured login is non-sensitive and is used to identify the bot's own
+marked summary comment. The token is read only from `GITHUB_TOKEN` and is not
+printed or recorded in the trace. A publish failure stops the command instead
+of being reported as a successful local-only run.
+
 ## Agent Loop
 
 RepoReview Agent uses a fixed-step loop for now:

@@ -1,10 +1,246 @@
 import json
 import sys
+from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import pytest
 
 from src.cli import run_review_agent
+from src.git_provider import GitProviderInputError, SUMMARY_COMMENT_MARKER
+from src.github_provider import GitHubAuthorizationError, GitHubPRProvider
+
+
+class SummaryHttpResponse:
+    def __init__(self, payload):
+        self._body = payload.encode("utf-8")
+        self.headers = {}
+
+    def read(self):
+        return self._body
+
+    def close(self):
+        pass
+
+
+def make_summary_publish_args(tmp_path, *, publish=False, trace=False):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text(
+        "def run():\n    print('debug')\n", encoding="utf-8"
+    )
+    diff_file = tmp_path / "input.diff"
+    diff_file.write_text(
+        """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1 +1,2 @@
+ def run():
++    print('debug')
+""",
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        diff=str(diff_file),
+        repo=str(repo),
+        max_context_chars=4000,
+        format="json",
+        output=None,
+        llm=False,
+        llm_provider="mock",
+        trace=trace,
+        trace_dir=str(tmp_path / "traces"),
+        max_extra_context_files=0,
+        publish_summary_comment=publish,
+        pr_url="https://github.com/acme/reviewed-repo/pull/42",
+    )
+
+
+def install_summary_provider(monkeypatch, http_open, *, token="test-token", author="reporeview-bot"):
+    monkeypatch.setattr(
+        "src.cli.GitHubPRProvider",
+        lambda: GitHubPRProvider(
+            token=token,
+            summary_comment_author_login=author,
+            http_open=http_open,
+        ),
+    )
+
+
+def install_summary_renderer(monkeypatch):
+    body = SUMMARY_COMMENT_MARKER + "\n## rendered by CLI integration test"
+
+    def render(issues, changed_files):
+        assert issues
+        assert changed_files
+        return body
+
+    monkeypatch.setattr("src.cli.render_summary_comment", render)
+    return body
+
+
+def test_cli_does_not_construct_summary_provider_without_opt_in(tmp_path, monkeypatch):
+    args = make_summary_publish_args(tmp_path)
+    monkeypatch.setattr(
+        "src.cli.GitHubPRProvider",
+        lambda: pytest.fail("summary provider must not be constructed"),
+    )
+
+    output, trace_steps = run_review_agent(args)
+
+    assert json.loads(output)["findings"]
+    assert not any(step["step"] == "publish_summary_comment" for step in trace_steps)
+
+
+def test_cli_publishes_summary_comment_when_opted_in(tmp_path, monkeypatch):
+    comments_url = "https://api.github.com/repos/acme/reviewed-repo/issues/42/comments"
+    requests = []
+    expected_body = install_summary_renderer(monkeypatch)
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            assert request.full_url == comments_url + "?per_page=100&page=1"
+            return SummaryHttpResponse("[]")
+        assert request.method == "POST"
+        assert request.full_url == comments_url
+        assert json.loads(request.data.decode("utf-8")) == {"body": expected_body}
+        return SummaryHttpResponse(json.dumps({"id": 73}))
+
+    token = "test-token-must-not-leak"
+    install_summary_provider(monkeypatch, http_open, token=token)
+    _output, trace_steps = run_review_agent(
+        make_summary_publish_args(tmp_path, publish=True, trace=True)
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert next(step for step in trace_steps if step["step"] == "publish_summary_comment")[
+        "detail"
+    ] == {"action": "created", "comment_id": 73}
+    trace_files = list((tmp_path / "traces").glob("*.json"))
+    assert len(trace_files) == 1
+    assert token not in trace_files[0].read_text(encoding="utf-8")
+
+
+def test_cli_updates_its_existing_summary_comment_when_opted_in(tmp_path, monkeypatch):
+    comments_url = "https://api.github.com/repos/acme/reviewed-repo/issues/42/comments"
+    update_url = "https://api.github.com/repos/acme/reviewed-repo/issues/comments/41"
+    requests = []
+    expected_body = install_summary_renderer(monkeypatch)
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            assert request.full_url == comments_url + "?per_page=100&page=1"
+            return SummaryHttpResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": 41,
+                            "body": SUMMARY_COMMENT_MARKER + "\nold",
+                            "user": {"login": "reporeview-bot"},
+                        }
+                    ]
+                )
+            )
+        assert request.method == "PATCH"
+        assert request.full_url == update_url
+        assert json.loads(request.data.decode("utf-8")) == {"body": expected_body}
+        return SummaryHttpResponse(json.dumps({"id": 41}))
+
+    install_summary_provider(monkeypatch, http_open)
+    _output, trace_steps = run_review_agent(make_summary_publish_args(tmp_path, publish=True))
+
+    assert [request.method for request in requests] == ["GET", "PATCH"]
+    assert next(step for step in trace_steps if step["step"] == "publish_summary_comment")[
+        "detail"
+    ] == {"action": "updated", "comment_id": 41}
+
+
+def test_cli_creates_summary_instead_of_updating_external_marker(tmp_path, monkeypatch):
+    comments_url = "https://api.github.com/repos/acme/reviewed-repo/issues/42/comments"
+    requests = []
+    expected_body = install_summary_renderer(monkeypatch)
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            return SummaryHttpResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": 41,
+                            "body": SUMMARY_COMMENT_MARKER + "\nexternal",
+                            "user": {"login": "collaborator"},
+                        }
+                    ]
+                )
+            )
+        assert request.method == "POST"
+        assert request.full_url == comments_url
+        assert json.loads(request.data.decode("utf-8")) == {"body": expected_body}
+        return SummaryHttpResponse(json.dumps({"id": 73}))
+
+    install_summary_provider(monkeypatch, http_open)
+    run_review_agent(make_summary_publish_args(tmp_path, publish=True))
+
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert all("/issues/comments/41" not in request.full_url for request in requests)
+
+
+def test_cli_propagates_summary_permission_failure_without_token_in_trace(
+    tmp_path, monkeypatch, capsys
+):
+    token = "test-token-must-not-leak"
+    requests = []
+    install_summary_renderer(monkeypatch)
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            return SummaryHttpResponse("[]")
+        assert request.method == "POST"
+        raise HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO())
+
+    install_summary_provider(monkeypatch, http_open, token=token)
+    args = make_summary_publish_args(tmp_path, publish=True, trace=True)
+
+    with pytest.raises(GitHubAuthorizationError, match="github_access_denied:status=403") as exc_info:
+        run_review_agent(args)
+
+    captured = capsys.readouterr()
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert token not in str(exc_info.value)
+    assert token not in captured.out
+    assert token not in captured.err
+    assert not list((tmp_path / "traces").glob("*.json"))
+
+
+def test_cli_rejects_missing_summary_author_before_http_call(tmp_path, monkeypatch, capsys):
+    token = "test-token-must-not-leak"
+    requests = []
+    monkeypatch.delenv("GITHUB_SUMMARY_COMMENT_AUTHOR_LOGIN", raising=False)
+    install_summary_renderer(monkeypatch)
+
+    def http_open(*_args, **_kwargs):
+        requests.append(True)
+        pytest.fail("unexpected HTTP call")
+
+    install_summary_provider(monkeypatch, http_open, token=token, author=None)
+    args = make_summary_publish_args(tmp_path, publish=True, trace=True)
+
+    with pytest.raises(
+        GitProviderInputError, match="^missing_summary_comment_author_login$"
+    ) as exc_info:
+        run_review_agent(args)
+
+    captured = capsys.readouterr()
+    assert requests == []
+    assert token not in str(exc_info.value)
+    assert token not in captured.out
+    assert token not in captured.err
+    assert not list((tmp_path / "traces").glob("*.json"))
 
 
 def test_cli_smoke_runs_simple_diff(tmp_path):
@@ -389,3 +625,172 @@ def test_cli_trace_records_context_provenance(tmp_path):
     saved_context = json.loads(trace_paths[0].read_text(encoding="utf-8"))["context_files"][0]
     assert saved_context["source"] == "changed_file"
     assert saved_context["selection_reason"] == "file is changed in the pull request"
+
+
+# ---------------------------------------------------------------------------
+# P0 regression: secret values in finding messages must not reach the PR body
+# ---------------------------------------------------------------------------
+
+P0_SECRET_MARKER = "LEAKED_SECRET_VALUE_42"
+P0_GITHUB_TOKEN_MARKER = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+P0_OPENAI_TOKEN_MARKER = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+
+
+def test_cli_redacts_secret_values_in_published_summary_body(tmp_path, monkeypatch):
+    """P0: a finding whose message quotes a credential value must be redacted
+    before the summary body is POSTed to GitHub, written to local output, or
+    saved to trace.
+    """
+    from src.schemas import ReviewIssue
+
+    args = make_summary_publish_args(tmp_path, publish=True, trace=True)
+
+    secret_path = "configs/API_KEY={}.py".format(P0_SECRET_MARKER)
+    source_file = Path(args.repo) / secret_path
+    source_file.parent.mkdir()
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    Path(args.diff).write_text(
+        """diff --git a/{path} b/{path}
+--- a/{path}
++++ b/{path}
+@@ -0,0 +1,1 @@
++value = 1
+""".format(path=secret_path),
+        encoding="utf-8",
+    )
+
+    # Inject a finding whose fields all contain a secret or token value.
+    def fake_review(changed_files):
+        return [
+            ReviewIssue(
+                file_path=secret_path,
+                line_no=1,
+                severity="error",
+                category="token={}".format(P0_SECRET_MARKER),
+                message="Hardcoded credential: {}".format(P0_GITHUB_TOKEN_MARKER),
+                suggestion="Replace {} with an environment variable".format(
+                    P0_OPENAI_TOKEN_MARKER
+                ),
+                reason=f"token={P0_SECRET_MARKER} is exposed",
+                evidence=f"app.py:1 API_KEY={P0_SECRET_MARKER}",
+                source="rule",
+            ),
+        ]
+
+    monkeypatch.setattr("src.cli.review_changed_files", fake_review)
+
+    requests = []
+
+    def http_open(request, timeout):
+        requests.append(request)
+        if request.method == "GET":
+            return SummaryHttpResponse("[]")
+        assert request.method == "POST"
+        return SummaryHttpResponse(json.dumps({"id": 73}))
+
+    install_summary_provider(monkeypatch, http_open)
+    output, trace_steps = run_review_agent(args)
+
+    # Secret must not appear in any HTTP request body (POST or PATCH).
+    for request in requests:
+        if request.data:
+            body = request.data.decode("utf-8")
+            assert P0_SECRET_MARKER not in body, (
+                "P0 泄露: secret marker 出现在 HTTP body 中"
+            )
+
+    # Secret must not appear in local output.
+    assert P0_SECRET_MARKER not in output, (
+        "P0 泄露: secret marker 出现在本地输出中"
+    )
+
+    assert P0_GITHUB_TOKEN_MARKER not in output
+    assert P0_OPENAI_TOKEN_MARKER not in output
+
+    # Secret must not appear in trace steps.
+    assert P0_SECRET_MARKER not in json.dumps(trace_steps, ensure_ascii=False), (
+        "P0 泄露: secret marker 出现在 trace_steps 中"
+    )
+
+    # Secret must not appear in saved trace files.
+    trace_files = list((tmp_path / "traces").glob("*.json"))
+    assert len(trace_files) == 1
+    assert P0_SECRET_MARKER not in trace_files[0].read_text(encoding="utf-8"), (
+        "P0 泄露: secret marker 出现在 trace 文件中"
+    )
+
+    trace_content = trace_files[0].read_text(encoding="utf-8")
+    assert P0_GITHUB_TOKEN_MARKER not in trace_content
+    assert P0_OPENAI_TOKEN_MARKER not in trace_content
+
+    # Verify redaction actually happened (finding was not silently dropped).
+    post_request = next(r for r in requests if r.method == "POST")
+    post_body = json.loads(post_request.data.decode("utf-8"))["body"]
+    assert P0_SECRET_MARKER not in post_body
+    assert P0_GITHUB_TOKEN_MARKER not in post_body
+    assert P0_OPENAI_TOKEN_MARKER not in post_body
+    assert "[REDACTED]" in post_body
+    assert "API_KEY=[REDACTED]" in post_body
+    assert "error" in post_body  # severity row is present
+
+
+# ---------------------------------------------------------------------------
+# P1 lifecycle: re-running the agent updates the same comment, not duplicate
+# ---------------------------------------------------------------------------
+
+def test_cli_create_then_update_summary_uses_same_comment_id(tmp_path, monkeypatch):
+    """P1: a second run must PATCH the comment created by the first run,
+    proving the 're-run does not duplicate' exit condition.
+    """
+    args = make_summary_publish_args(tmp_path, publish=True)
+    expected_body = install_summary_renderer(monkeypatch)
+
+    get_count = [0]
+    all_requests = []
+
+    def http_open(request, timeout):
+        all_requests.append(request)
+        if request.method == "GET":
+            get_count[0] += 1
+            if get_count[0] == 1:
+                # First run: no existing marked comment.
+                return SummaryHttpResponse("[]")
+            # Second run: the comment created by the first run now exists.
+            return SummaryHttpResponse(
+                json.dumps(
+                    [
+                        {
+                            "id": 73,
+                            "body": SUMMARY_COMMENT_MARKER + "\n## RepoReview summary",
+                            "user": {"login": "reporeview-bot"},
+                        }
+                    ]
+                )
+            )
+        if request.method == "POST":
+            assert json.loads(request.data.decode("utf-8")) == {"body": expected_body}
+            return SummaryHttpResponse(json.dumps({"id": 73}))
+        if request.method == "PATCH":
+            assert request.full_url == (
+                "https://api.github.com/repos/acme/reviewed-repo/issues/comments/73"
+            )
+            assert json.loads(request.data.decode("utf-8")) == {"body": expected_body}
+            return SummaryHttpResponse(json.dumps({"id": 73}))
+        raise AssertionError("unexpected method: {}".format(request.method))
+
+    install_summary_provider(monkeypatch, http_open)
+
+    # First run: creates comment with id 73.
+    _output1, trace_steps1 = run_review_agent(args)
+    publish1 = next(s for s in trace_steps1 if s["step"] == "publish_summary_comment")
+    assert publish1["detail"] == {"action": "created", "comment_id": 73}
+
+    # Second run: updates the same comment (PATCH, not POST).
+    _output2, trace_steps2 = run_review_agent(args)
+    publish2 = next(s for s in trace_steps2 if s["step"] == "publish_summary_comment")
+    assert publish2["detail"] == {"action": "updated", "comment_id": 73}
+
+    # Sequence: GET (1st run), POST (1st run), GET (2nd run), PATCH (2nd run).
+    # No duplicate POST — the second run updates the same comment.
+    assert [r.method for r in all_requests] == ["GET", "POST", "GET", "PATCH"]
+    assert get_count[0] == 2

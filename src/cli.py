@@ -13,7 +13,13 @@ from pathlib import Path
 from dataclasses import asdict
 from time import perf_counter
 
-from .reporter import render_json_report, render_markdown_report
+from .git_provider import parse_pull_request_ref
+from .github_provider import GitHubPRProvider
+from .reporter import (
+    render_json_report,
+    render_markdown_report,
+    render_summary_comment,
+)
 from .schemas import ContextBudget
 
 from .reviewers import review_changed_files
@@ -21,7 +27,7 @@ from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
 from .llm_reviewer import review_with_llm
 from .llm_client import get_call_model, LLMClientError
-from .trace import sanitize_trace_text
+from .trace import redact_sensitive_structure, sanitize_trace_text
 from .validation import validate_issue_locations
 
 
@@ -47,6 +53,15 @@ def parse_args():
     parser.add_argument(
         "--output",
         help="Path to save file. If not specified, print to stdout.",
+    )
+    parser.add_argument(
+        "--publish-summary-comment",
+        action="store_true",
+        help="Publish the validated review summary to the specified GitHub PR.",
+    )
+    parser.add_argument(
+        "--pr-url",
+        help="GitHub pull request URL used with --publish-summary-comment.",
     )
 
     parser.add_argument(
@@ -97,6 +112,8 @@ def parse_args():
 
     if args.max_extra_context_files < 0:
         parser.error("--max-extra-context-files must be greater than or equal to 0")
+    if args.publish_summary_comment and not args.pr_url:
+        parser.error("--publish-summary-comment requires --pr-url")
 
     return args
 
@@ -154,7 +171,7 @@ def record_step(state, step, detail=None, started_at_perf=None):
     state.trace_steps.append({
         "step":step,
         "duration_ms":duration_ms,
-        "detail":detail or {},
+        "detail":redact_sensitive_structure(detail or {}),
     })
 
 
@@ -327,6 +344,18 @@ def run_review_agent(args):
     record_step(state, "render_report",{
         "format":state.output_format,
     }, started_at_perf=step_started_at_perf)
+
+    if getattr(args, "publish_summary_comment", False):
+        step_started_at_perf = perf_counter()
+        reference = parse_pull_request_ref(pr_url=getattr(args, "pr_url", None))
+        summary_body = render_summary_comment(state.issues, state.changed_files)
+        result = GitHubPRProvider().publish_summary_comment(reference, summary_body)
+        record_step(
+            state,
+            "publish_summary_comment",
+            {"action": result.action, "comment_id": result.comment_id},
+            started_at_perf=step_started_at_perf,
+        )
 
     if state.trace_enabled:
         save_started_at_perf = perf_counter()

@@ -24,12 +24,38 @@ _SENSITIVE_VALUE_PATTERNS = (
         r"(?:['\"]\s*)?[=:]\s*)(?:['\"])?[^\s,'\";}\]]+"
     ),
 )
+_BARE_SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
+)
+
+
+def redact_sensitive_values(value):
+    """Redact labeled and recognizable bare credentials without truncating."""
+    text = str(value)
+    for pattern in _SENSITIVE_VALUE_PATTERNS:
+        text = pattern.sub(r"\1[REDACTED]", text)
+    for pattern in _BARE_SENSITIVE_VALUE_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def redact_sensitive_structure(value):
+    """Recursively redact string values before structured trace persistence."""
+    if isinstance(value, dict):
+        return {key: redact_sensitive_structure(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_sensitive_structure(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive_structure(item) for item in value)
+    if isinstance(value, str):
+        return redact_sensitive_values(value)
+    return value
 
 
 def sanitize_trace_text(value, max_chars=300):
-    text=str(value)
-    for pattern in _SENSITIVE_VALUE_PATTERNS:
-        text = pattern.sub(r"\1[REDACTED]", text)
+    text = redact_sensitive_values(value)
     if len(text)<=max_chars:
         return text
     return text[:max_chars]+"..."
@@ -52,10 +78,10 @@ def save_trace(state, trace_dir="traces", final_step=None):
 
     payload={
         "task_id":state.task_id,
-        "steps":state.trace_steps,
+        "steps":redact_sensitive_structure(state.trace_steps),
         "input_files":[
             {
-                "path":changed_file.path,
+                "path":redact_sensitive_values(changed_file.path),
                 "added_lines":len(changed_file.added_lines),
                 "deleted_lines":len(changed_file.deleted_lines),
             }
@@ -63,13 +89,13 @@ def save_trace(state, trace_dir="traces", final_step=None):
         ],
         "context_files":[
             {
-                "path":context.path,
+                "path":redact_sensitive_values(context.path),
                 "exists":context.exists,
                 "chars_read":context.chars_read,
                 "truncated":context.truncated,
-                "error":context.error,
-                "source":context.source,
-                "selection_reason":context.selection_reason,
+                "error":redact_sensitive_values(context.error),
+                "source":redact_sensitive_values(context.source),
+                "selection_reason":redact_sensitive_values(context.selection_reason),
             }
             for context in state.contexts
         ],
@@ -95,7 +121,7 @@ def save_trace(state, trace_dir="traces", final_step=None):
                 "detail": final_step.get("detail", {}),
             }
         )
-        payload["steps"] = state.trace_steps
+        payload["steps"] = redact_sensitive_structure(state.trace_steps)
         trace_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

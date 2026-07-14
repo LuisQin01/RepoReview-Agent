@@ -6,6 +6,9 @@ reviewers.py负责审查代码
 import json
 from collections import Counter
 
+from .git_provider import SUMMARY_COMMENT_MARKER
+from .trace import redact_sensitive_values
+
 def _severity_for_json(severity):
     mapping={
         "error":"high",
@@ -29,14 +32,14 @@ def _context_status(context):
 def issue_to_finding(issue):
     return {
         "severity":_severity_for_json(issue.severity),
-        "category":issue.category,
-        "file":issue.file_path,
+        "category":redact_sensitive_values(issue.category),
+        "file":redact_sensitive_values(issue.file_path),
         "line":issue.line_no,
-        "issue":issue.message,
-        "reason":issue.reason,
-        "suggested_fix":issue.suggestion,
+        "issue":redact_sensitive_values(issue.message),
+        "reason":redact_sensitive_values(issue.reason),
+        "suggested_fix":redact_sensitive_values(issue.suggestion),
         "confidence":issue.confidence,
-        "evidence":issue.evidence,
+        "evidence":redact_sensitive_values(issue.evidence),
         "source":issue.source,
     }
 
@@ -84,10 +87,10 @@ def render_markdown_report(issues, changed_files, contexts):
             "| "
             + " | ".join(
                 [
-                    _escape_table_cell(changed_file.path),
+                    _escape_table_cell(redact_sensitive_values(changed_file.path)),
                     str(len(changed_file.added_lines)),
                     str(len(changed_file.deleted_lines)),
-                    _escape_table_cell(status),
+                    _escape_table_cell(redact_sensitive_values(status)),
                 ]
             )
             + " |"
@@ -113,9 +116,11 @@ def render_markdown_report(issues, changed_files, contexts):
                 "| "
                 + " | ".join(
                     [
-                        _escape_table_cell(context.path),
+                        _escape_table_cell(redact_sensitive_values(context.path)),
                         context_type,
-                        _escape_table_cell(_context_status(context)),
+                        _escape_table_cell(
+                            redact_sensitive_values(_context_status(context))
+                        ),
                     ]
                 )
                 + " |"
@@ -154,14 +159,14 @@ def render_markdown_report(issues, changed_files, contexts):
                 + " | ".join(
                     [
                         _escape_table_cell(issue.severity),
-                        _escape_table_cell(issue.file_path),
+                        _escape_table_cell(redact_sensitive_values(issue.file_path)),
                         str(issue.line_no),
-                        _escape_table_cell(issue.category),
-                        _escape_table_cell(issue.message),
-                        _escape_table_cell(issue.reason),
-                        _escape_table_cell(issue.suggestion),
+                        _escape_table_cell(redact_sensitive_values(issue.category)),
+                        _escape_table_cell(redact_sensitive_values(issue.message)),
+                        _escape_table_cell(redact_sensitive_values(issue.reason)),
+                        _escape_table_cell(redact_sensitive_values(issue.suggestion)),
                         _escape_table_cell("" if issue.confidence is None else issue.confidence),
-                        _escape_table_cell(issue.evidence),
+                        _escape_table_cell(redact_sensitive_values(issue.evidence)),
                         _escape_table_cell(issue.source),
                     ]
                 )
@@ -177,4 +182,55 @@ def render_markdown_report(issues, changed_files, contexts):
         "",
     ])
 
+    return "\n".join(lines)
+
+
+def render_summary_comment(issues, changed_files):
+    """Render the compact, marked summary that is safe to update in a PR."""
+    severity_counts = Counter(issue.severity for issue in issues)
+    severity_order = {"error": 0, "warning": 1, "info": 2}
+    lines = [
+        SUMMARY_COMMENT_MARKER,
+        "## RepoReview summary",
+        "",
+        "- Changed files: {}".format(len(changed_files)),
+        "- Findings: {}".format(len(issues)),
+        "- Errors: {}".format(severity_counts.get("error", 0)),
+        "- Warnings: {}".format(severity_counts.get("warning", 0)),
+        "- Info: {}".format(severity_counts.get("info", 0)),
+        "",
+        "### Findings",
+        "",
+    ]
+
+    if not issues:
+        lines.append("No findings.")
+        return "\n".join(lines)
+
+    lines.extend([
+        "| Severity | File | Line | Category | Issue |",
+        "| --- | --- | ---: | --- | --- |",
+    ])
+    for issue in sorted(
+        issues,
+        key=lambda issue: (
+            severity_order.get(issue.severity, 99),
+            issue.file_path,
+            issue.line_no,
+            issue.category,
+        ),
+    ):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _escape_table_cell(issue.severity),
+                    _escape_table_cell(redact_sensitive_values(issue.file_path)),
+                    str(issue.line_no),
+                    _escape_table_cell(redact_sensitive_values(issue.category)),
+                    _escape_table_cell(redact_sensitive_values(issue.message)),
+                ]
+            )
+            + " |"
+        )
     return "\n".join(lines)

@@ -8,6 +8,8 @@
 7. 汇总输出指标
 '''
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path

@@ -25,6 +25,9 @@ import json
 import os
 import time
 from functools import partial
+from typing import Mapping, Sequence
+
+from .model_protocol import JSONValue, ModelResponse, ModelProtocolError
 
 
 # 默认单次请求超时（秒）：平衡响应速度与偶发慢请求容忍度
@@ -56,6 +59,51 @@ class LLMConfigurationError(LLMClientError):
     配置错误：例如缺少 OPENAI_API_KEY、指定了不支持的 provider / fixture。
     这类错误重试无意义，直接向上抛出。
     """
+
+
+class ScriptedMockProvider:
+    """Return one internal response or failure for each offline scripted request.
+
+    This is intentionally separate from ``get_call_model``: the legacy fixed
+    pipeline consumes text, while the future controller consumes ModelResponse.
+    """
+
+    def __init__(
+        self,
+        script: Sequence[ModelResponse | Mapping[str, JSONValue] | str | Exception],
+    ) -> None:
+        self._script = tuple(script)
+        self._next_index = 0
+        self.requests: list[dict[str, JSONValue]] = []
+
+    @property
+    def consumed_count(self) -> int:
+        """Return how many script entries were consumed by actual requests."""
+        return self._next_index
+
+    def complete(self, request: Mapping[str, JSONValue]) -> ModelResponse:
+        """Record one request and consume exactly one scripted result or failure."""
+        try:
+            request_copy = json.loads(json.dumps(dict(request), allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise ModelProtocolError("mock_request_must_be_json_serializable") from exc
+        if not isinstance(request_copy, dict):
+            raise ModelProtocolError("mock_request_must_be_an_object")
+        self.requests.append(request_copy)
+        if self._next_index >= len(self._script):
+            raise LLMClientError("mock_script_exhausted")
+
+        item = self._script[self._next_index]
+        self._next_index += 1
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, ModelResponse):
+            return item
+        if isinstance(item, str):
+            return ModelResponse.from_json(item)
+        if isinstance(item, Mapping):
+            return ModelResponse.from_dict(item)
+        raise ModelProtocolError("mock_script_item_unsupported")
 
 
 # Mock 响应夹具：供测试与 CLI 冒烟使用，覆盖“正常”“空结果”“超时”“非法 JSON”等典型场景。

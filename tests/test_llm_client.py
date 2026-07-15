@@ -33,9 +33,69 @@ import pytest
 
 from src.llm_client import (
     LLMConfigurationError,
+    LLMClientError,
     LLMRetryableError,
+    ScriptedMockProvider,
     get_call_model,
 )
+from src.model_protocol import ModelProtocolError, ModelResponse
+
+
+def test_scripted_mock_provider_returns_internal_responses_and_records_requests():
+    provider = ScriptedMockProvider(
+        [
+            {
+                "tool_calls": [
+                    {"call_id": "call-1", "name": "unknown_tool", "arguments": {}}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            ModelResponse(text="done", finish_reason="stop"),
+        ]
+    )
+
+    first = provider.complete({"messages": [{"role": "user", "content": "review"}]})
+    second = provider.complete({"messages": []})
+
+    assert first.tool_calls[0].call_id == "call-1"
+    assert first.tool_calls[0].name == "unknown_tool"
+    assert second.text == "done"
+    assert provider.consumed_count == 2
+    assert provider.requests == [
+        {"messages": [{"role": "user", "content": "review"}]},
+        {"messages": []},
+    ]
+
+
+@pytest.mark.parametrize(
+    "script_item, error",
+    [
+        ("{bad json", "model_response_invalid_json"),
+        (
+            '{"tool_calls": [{"call_id": "call-2", "name": "read", "arguments": "{bad"}]}',
+            "tool_call_arguments_invalid_json",
+        ),
+        (LLMRetryableError("scripted_provider_failure"), "scripted_provider_failure"),
+    ],
+)
+def test_scripted_mock_provider_consumes_bad_items_and_raises(script_item, error):
+    provider = ScriptedMockProvider([script_item, ModelResponse(text="unused")])
+
+    with pytest.raises((ModelProtocolError, LLMRetryableError), match=error):
+        provider.complete({"turn": 1})
+
+    assert provider.consumed_count == 1
+    assert provider.requests == [{"turn": 1}]
+
+
+def test_scripted_mock_provider_exhaustion_is_an_explicit_error_not_a_response():
+    provider = ScriptedMockProvider([])
+
+    with pytest.raises(LLMClientError, match="mock_script_exhausted"):
+        provider.complete({"turn": 1})
+
+    assert provider.consumed_count == 0
+    assert provider.requests == [{"turn": 1}]
 
 
 def test_mock_retryable_failures_recover_with_exponential_backoff():

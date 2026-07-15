@@ -16,13 +16,125 @@ precision/recall/f1/false_positive_rate 等指标，支撑模型/提示词迭代
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
+from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from time import perf_counter
+import platform
+import subprocess
+import sys
 
 import json
 
 from .review_service import ReviewRequest, ReviewService
 from .schemas import ContextBudget
+
+
+BASELINE_SCHEMA_VERSION = "m7_fixed_baseline.v1"
+
+
+@dataclass(frozen=True)
+class SourceRevision:
+    """Verified source identity used to compare fixed-baseline results."""
+
+    commit: str
+    worktree_state: str
+    worktree_diff_sha256: str | None
+
+M7_FIXED_BASELINE_PREREQUISITES = {
+    "M2": {
+        "status": "confirmed",
+        "evidence": [
+            "src/file_context.py",
+            "tests/test_file_context.py",
+        ],
+    },
+    "M3": {
+        "status": "confirmed",
+        "evidence": [
+            "src/validation.py",
+            "tests/test_validation.py",
+            "tests/test_sensitive_leak.py",
+        ],
+    },
+    "M4": {
+        "status": "confirmed",
+        "evidence": [
+            "src/eval_runner.py",
+            "tests/test_eval_runner.py",
+            "src/trace.py",
+            "tests/test_trace.py",
+        ],
+    },
+}
+
+
+def capture_source_revision(
+    repo_root: Path,
+    *,
+    excluded_untracked_paths: Iterable[str | Path] = (),
+) -> SourceRevision:
+    """Return the current Git commit and a verifiable snapshot of local changes.
+
+    The baseline's source identity is collected from Git rather than trusting
+    command-line metadata.  A dirty worktree remains usable, but its tracked
+    diff is fingerprinted so it cannot be confused with a clean commit.  The
+    current baseline output may be excluded when it is an untracked file inside
+    the repository: it is generated after this snapshot and is not source input.
+    """
+    def git_output(*arguments: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=repo_root,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise ValueError("fixed_baseline_source_unavailable") from exc
+        if completed.returncode != 0:
+            raise ValueError("fixed_baseline_source_unavailable")
+        return completed.stdout
+
+    repo_root = repo_root.resolve()
+    excluded_paths = set()
+    for path in excluded_untracked_paths:
+        try:
+            excluded_path = Path(path).resolve().relative_to(repo_root)
+        except ValueError:
+            continue
+        excluded_paths.add(excluded_path.as_posix().encode("utf-8"))
+
+    commit = git_output("rev-parse", "HEAD").decode("ascii").strip()
+    status = git_output("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    status_entries = [entry for entry in status.split(b"\0") if entry]
+    retained_status_entries = [
+        entry
+        for entry in status_entries
+        if not (
+            entry.startswith(b"?? ") and entry[3:] in excluded_paths
+        )
+    ]
+    if not retained_status_entries:
+        return SourceRevision(
+            commit=commit,
+            worktree_state="clean",
+            worktree_diff_sha256=None,
+        )
+
+    # ``git diff HEAD`` deliberately excludes untracked files.  Recording its
+    # hash would therefore misidentify a baseline whose cases or source files
+    # differ only through untracked content.
+    if any(entry.startswith(b"?? ") for entry in retained_status_entries):
+        raise ValueError("unsupported")
+
+    diff = git_output("diff", "--binary", "HEAD")
+    return SourceRevision(
+        commit=commit,
+        worktree_state="dirty",
+        worktree_diff_sha256=hashlib.sha256(diff).hexdigest(),
+    )
 
 def load_expected(case_dir: Path):
     """读取单个 case 目录下的期望结果 ``expected.json``。
@@ -297,6 +409,96 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock"):
     return metrics
 
 
+def build_fixed_baseline_record(
+    metrics: dict,
+    *,
+    cases_dir: str,
+    repo_root: str,
+    llm_provider: str,
+    commit: str,
+    worktree_state: str,
+    worktree_diff_sha256: str | None,
+    baseline_output: str,
+) -> dict:
+    """Build a machine-readable record for an M7 fixed-pipeline baseline.
+
+    The fixed pipeline does not invoke the LLM, so the call count is known to
+    be zero.  It also does not expose token usage, which is recorded as
+    unavailable instead of being guessed as zero.
+
+    Args:
+        metrics: Metrics returned by :func:`run_eval`.
+        cases_dir: Reproducible case-set argument used for the run.
+        repo_root: Repository argument used for the run.
+        llm_provider: Configured provider name; it remains unused in fixed mode.
+        commit: Source revision supplied by the caller, or ``"unknown"``.
+        worktree_state: Source-tree state supplied by the caller (for example
+            ``"clean"``, ``"dirty"``, or ``"unknown"``).
+        worktree_diff_sha256: SHA-256 of the Git diff when the tree is dirty.
+        baseline_output: Destination passed to ``--baseline-output``.
+
+    Returns:
+        A JSON-serializable baseline record containing configuration and
+        complete per-case metrics.
+    """
+    context_budget = ContextBudget()
+    return {
+        "schema_version": BASELINE_SCHEMA_VERSION,
+        "review_mode": "fixed",
+        "commit": commit,
+        "worktree_state": worktree_state,
+        "worktree_diff_sha256": worktree_diff_sha256,
+        "configuration": {
+            "cases": cases_dir,
+            "repo": repo_root,
+            "use_llm": False,
+            "llm_provider": llm_provider,
+            "context_budget": {
+                "max_prompt_chars": context_budget.max_prompt_chars,
+                "max_extra_context_files": context_budget.max_extra_context_files,
+            },
+        },
+        "environment": {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+        },
+        "reproduction": {
+            # Keep the command free of optional LLM flags: this record is only
+            # comparable with the deterministic fixed pipeline.
+            "command": (
+                "py -m src.eval_runner "
+                f"--cases {cases_dir} --repo {repo_root} "
+                f"--baseline-output {baseline_output} "
+                f"--commit {commit} --worktree-state {worktree_state}"
+            ),
+        },
+        "prerequisite_capabilities": M7_FIXED_BASELINE_PREREQUISITES,
+        "observability": {
+            "llm_call_count": 0,
+            "token_usage": {
+                "available": False,
+                "reason": "fixed_pipeline_does_not_expose_token_usage",
+            },
+        },
+        "metrics": metrics,
+    }
+
+
+def write_baseline_record(output_path: str | Path, record: dict) -> None:
+    """Persist a JSON baseline record, surfacing write failures to the caller.
+
+    Parent directories are created when needed.  ``OSError`` and JSON
+    serialization failures intentionally propagate so a failed baseline is
+    never reported as successfully saved.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_args():
     """解析评估器 CLI 参数。
 
@@ -308,6 +510,21 @@ def parse_args():
     parser.add_argument("--repo", default=".")
     parser.add_argument("--llm", action="store_true")
     parser.add_argument("--llm-provider", default="mock", choices=["mock", "openai"])
+    parser.add_argument(
+        "--baseline-output",
+        help="Optional path for a machine-readable M7 fixed-pipeline baseline JSON.",
+    )
+    parser.add_argument(
+        "--commit",
+        default="unknown",
+        help="Source revision recorded in --baseline-output (default: unknown).",
+    )
+    parser.add_argument(
+        "--worktree-state",
+        choices=["clean", "dirty", "unknown"],
+        default="unknown",
+        help="Source-tree state recorded in --baseline-output (default: unknown).",
+    )
     return parser.parse_args()
 
 
@@ -315,12 +532,44 @@ def main():
     """评估器主入口：解析参数 → 跑全部 case → 打印指标与明细。"""
     args = parse_args()
 
+    # A fixed baseline must never execute the optional LLM path.  Validate
+    # before starting Eval so an invalid request cannot incur model calls.
+    if args.baseline_output and args.llm:
+        raise ValueError("fixed_baseline_requires_llm_disabled")
+
+    source_revision = None
+    if args.baseline_output:
+        source_revision = capture_source_revision(
+            Path(__file__).resolve().parent.parent,
+            excluded_untracked_paths=(args.baseline_output,),
+        )
+        if args.commit != "unknown" and args.commit != source_revision.commit:
+            raise ValueError("fixed_baseline_commit_mismatch")
+        if (
+            args.worktree_state != "unknown"
+            and args.worktree_state != source_revision.worktree_state
+        ):
+            raise ValueError("fixed_baseline_worktree_state_mismatch")
+
     metrics = run_eval(
         cases_dir=args.cases,
         repo_root=args.repo,
         use_llm=args.llm,
         llm_provider=args.llm_provider,
     )
+
+    if args.baseline_output:
+        record = build_fixed_baseline_record(
+            metrics,
+            cases_dir=args.cases,
+            repo_root=args.repo,
+            llm_provider=args.llm_provider,
+            commit=source_revision.commit,
+            worktree_state=source_revision.worktree_state,
+            worktree_diff_sha256=source_revision.worktree_diff_sha256,
+            baseline_output=args.baseline_output,
+        )
+        write_baseline_record(args.baseline_output, record)
 
     # 打印全局汇总指标
     print(f"cases: {metrics['cases']}")
@@ -335,10 +584,24 @@ def main():
     print(f"false_positive_rate: {metrics['false_positive_rate']:.2f}")
     print(f"false_negative_count: {metrics['false_negative_count']}")
 
+    if args.baseline_output:
+        print(f"baseline_output: {args.baseline_output}")
+
     # 空行分隔后打印每个 case 的明细结果，便于定位失败 case
     print()
     print(json.dumps(metrics["results"], ensure_ascii=False, indent=2))
 
 
+def cli_main() -> None:
+    """Run the CLI and render expected fixed-baseline failures safely."""
+    try:
+        main()
+    except ValueError as exc:
+        if str(exc) != "unsupported":
+            raise
+        print("unsupported", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    main()
+    cli_main()

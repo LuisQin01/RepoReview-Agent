@@ -19,6 +19,9 @@ precision / recall / f1 / hit_rate / false_positive_rate 等指标。
 """
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -488,3 +491,366 @@ def test_run_eval_false_positive_rate_uses_clean_cases_as_denominator(tmp_path, 
     assert metrics["precision"] == 0.0
     # 不变量：无 TP -> recall 为 0
     assert metrics["recall"] == 0.0
+
+
+def test_fixed_baseline_record_preserves_configuration_metrics_and_observability():
+    """固定基线记录必须如实保存模式、配置、指标与不可用 token 语义。"""
+    metrics = {
+        "precision": 0.5,
+        "recall": 1.0,
+        "f1": 2 / 3,
+        "false_positive_rate": 0.25,
+        "results": [{"case_id": "case-a", "duration_ms": 12}],
+    }
+
+    record = eval_runner.build_fixed_baseline_record(
+        metrics,
+        cases_dir="evals/cases",
+        repo_root=".",
+        llm_provider="mock",
+        commit="abc123",
+        worktree_state="dirty",
+        worktree_diff_sha256="a" * 64,
+        baseline_output="evals/baselines/m7-0-fixed.json",
+    )
+
+    assert record["schema_version"] == "m7_fixed_baseline.v1"
+    assert record["review_mode"] == "fixed"
+    assert record["commit"] == "abc123"
+    assert record["worktree_state"] == "dirty"
+    assert record["worktree_diff_sha256"] == "a" * 64
+    assert record["configuration"] == {
+        "cases": "evals/cases",
+        "repo": ".",
+        "use_llm": False,
+        "llm_provider": "mock",
+        "context_budget": {
+            "max_prompt_chars": 4000,
+            "max_extra_context_files": 3,
+        },
+    }
+    assert record["prerequisite_capabilities"]["M2"]["status"] == "confirmed"
+    assert record["prerequisite_capabilities"]["M3"]["status"] == "confirmed"
+    assert record["prerequisite_capabilities"]["M4"]["status"] == "confirmed"
+    assert set(record["environment"]) == {"python_version", "platform"}
+    assert record["reproduction"] == {
+        "command": (
+            "py -m src.eval_runner --cases evals/cases --repo . "
+            "--baseline-output evals/baselines/m7-0-fixed.json "
+            "--commit abc123 --worktree-state dirty"
+        )
+    }
+    assert record["observability"]["llm_call_count"] == 0
+    assert record["observability"]["token_usage"] == {
+        "available": False,
+        "reason": "fixed_pipeline_does_not_expose_token_usage",
+    }
+    assert record["metrics"] == metrics
+
+
+def test_write_baseline_record_creates_json_artifact(tmp_path):
+    """基线产物必须可由脚本重新读取，且父目录可由写入函数创建。"""
+    output_path = tmp_path / "nested" / "baseline.json"
+    record = {"schema_version": "m7_fixed_baseline.v1", "metrics": {"cases": 1}}
+
+    eval_runner.write_baseline_record(output_path, record)
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == record
+
+
+def test_write_baseline_record_does_not_report_a_write_failure_as_success(
+    tmp_path, monkeypatch
+):
+    """写入失败必须向调用方传播，不能生成伪造的成功基线。"""
+    output_path = tmp_path / "baseline.json"
+
+    def raise_write_error(self, *args, **kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(type(output_path), "write_text", raise_write_error)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        eval_runner.write_baseline_record(output_path, {"metrics": {}})
+
+
+def test_main_rejects_llm_enabled_fixed_baseline(tmp_path, monkeypatch):
+    """固定基线不得和 LLM 启用的运行结果混用。"""
+    output_path = tmp_path / "baseline.json"
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=True,
+        llm_provider="mock",
+        baseline_output=str(output_path),
+        commit="abc123",
+        worktree_state="clean",
+    )
+
+    calls = []
+
+    def unexpected_run_eval(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("invalid fixed baseline must not start Eval")
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "run_eval", unexpected_run_eval)
+
+    with pytest.raises(ValueError, match="fixed_baseline_requires_llm_disabled"):
+        eval_runner.main()
+
+    assert not output_path.exists()
+    assert calls == []
+
+
+def test_main_writes_a_readable_fixed_baseline_with_reproduction_command(
+    tmp_path, monkeypatch
+):
+    """CLI 产物必须可读，且保留本次 fixed Eval 的复制命令。"""
+    output_path = tmp_path / "baseline.json"
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output=str(output_path),
+        commit="abc123",
+        worktree_state="clean",
+    )
+    metrics = {
+        "cases": 1,
+        "category_hit_rate": 1.0,
+        "false_positive_count": 0,
+        "json_valid_rate": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "false_positive_rate": 0.0,
+        "false_negative_count": 0,
+        "average_findings": 1.0,
+        "average_duration_ms": 12.0,
+        "results": [],
+    }
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "run_eval", lambda **kwargs: metrics)
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision(
+            commit="abc123",
+            worktree_state="clean",
+            worktree_diff_sha256=None,
+        ),
+    )
+
+    eval_runner.main()
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["metrics"] == metrics
+    assert record["reproduction"]["command"] == (
+        f"py -m src.eval_runner --cases evals/cases --repo . "
+        f"--baseline-output {output_path} --commit abc123 --worktree-state clean"
+    )
+
+
+def test_capture_source_revision_fingerprints_a_dirty_tracked_diff(monkeypatch, tmp_path):
+    """Dirty snapshots must bind the recorded commit to a deterministic diff hash."""
+    outputs = iter((b"abc123\n", b" M src/eval_runner.py\n", b"diff --git a/x b/x\n"))
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(outputs))
+
+    monkeypatch.setattr(eval_runner.subprocess, "run", fake_run)
+
+    revision = eval_runner.capture_source_revision(tmp_path)
+
+    assert revision.commit == "abc123"
+    assert revision.worktree_state == "dirty"
+    assert revision.worktree_diff_sha256 == (
+        "1a059963bbf3198857755a48c741d351e21515186ce951464b89a0de0797c081"
+    )
+
+
+def test_main_rejects_untracked_files_before_starting_fixed_baseline_eval(
+    tmp_path, monkeypatch
+):
+    """Untracked input cannot be represented by the tracked-diff fingerprint."""
+    output_path = tmp_path / "baseline.json"
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output=str(output_path),
+        commit="unknown",
+        worktree_state="unknown",
+    )
+    git_outputs = iter((b"abc123\n", b"?? evals/cases/new-case/expected.json\n"))
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(git_outputs))
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(eval_runner, "run_eval", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(ValueError, match="unsupported"):
+        eval_runner.main()
+
+    assert calls == []
+    assert not output_path.exists()
+
+
+def test_main_can_record_the_same_untracked_baseline_output_twice_in_a_git_repo(
+    tmp_path, monkeypatch
+):
+    """A generated baseline is output, not untracked source input, on rerun."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.email", "tests@example.invalid")
+    git("config", "user.name", "Eval Test")
+    (repo_root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "initial")
+
+    output_path = repo_root / "evals" / "baselines" / "fixed.json"
+    commit = git("rev-parse", "HEAD").stdout.decode("ascii").strip()
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output="evals/baselines/fixed.json",
+        commit=commit,
+        worktree_state="clean",
+    )
+    metrics = {
+        "cases": 0,
+        "category_hit_rate": 0.0,
+        "false_positive_count": 0,
+        "json_valid_rate": 0.0,
+        "average_findings": 0.0,
+        "average_duration_ms": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "false_positive_rate": 0.0,
+        "false_negative_count": 0,
+        "results": [],
+    }
+
+    (repo_root / "src").mkdir()
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(eval_runner, "__file__", str(repo_root / "src" / "eval_runner.py"))
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "run_eval", lambda **kwargs: metrics)
+
+    eval_runner.main()
+    assert output_path.exists()
+    assert git("status", "--porcelain").stdout == b"?? evals/\n"
+
+    eval_runner.main()
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["metrics"] == metrics
+    assert record["reproduction"]["command"] == (
+        "py -m src.eval_runner --cases evals/cases --repo . "
+        "--baseline-output evals/baselines/fixed.json "
+        f"--commit {commit} --worktree-state clean"
+    )
+
+    (repo_root / "untracked-input.txt").write_text("input\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported"):
+        eval_runner.main()
+
+
+def test_main_rejects_spoofed_baseline_commit_before_eval(tmp_path, monkeypatch):
+    """Caller-supplied commit metadata must not misidentify the measured source."""
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output=str(tmp_path / "baseline.json"),
+        commit="spoofed",
+        worktree_state="clean",
+    )
+    calls = []
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision("actual", "clean", None),
+    )
+    monkeypatch.setattr(eval_runner, "run_eval", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(ValueError, match="fixed_baseline_commit_mismatch"):
+        eval_runner.main()
+
+    assert calls == []
+
+
+def test_cli_reports_unsupported_without_traceback_or_absolute_paths(tmp_path):
+    """The expected unsupported CLI failure must be safe for scripts to parse."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.email", "tests@example.invalid")
+    git("config", "user.name", "Eval Test")
+    (repo_root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "initial")
+    (repo_root / "untracked-input.txt").write_text("input\n", encoding="utf-8")
+    (repo_root / "src").mkdir()
+
+    workspace_root = Path(__file__).resolve().parent.parent
+    script = "\n".join(
+        (
+            "import sys",
+            "from src import eval_runner",
+            "module_file, baseline_output = sys.argv[1:]",
+            "eval_runner.__file__ = module_file",
+            "sys.argv = ['eval_runner.py', '--baseline-output', baseline_output]",
+            "eval_runner.cli_main()",
+        )
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(repo_root / "src" / "eval_runner.py"),
+            str(repo_root / "evals" / "baselines" / "fixed.json"),
+        ],
+        cwd=workspace_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "unsupported\n"
+    assert "Traceback" not in completed.stderr
+    assert str(repo_root) not in completed.stderr
+    assert str(workspace_root) not in completed.stderr

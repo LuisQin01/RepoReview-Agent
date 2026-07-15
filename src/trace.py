@@ -49,6 +49,11 @@ _BARE_SENSITIVE_VALUE_PATTERNS = (
     # OpenAI API key 前缀 sk-，含 proj-/svcacct- 变体
     re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"),
 )
+# The longest bare-token rule needs 31 characters before it can be recognized
+# (``github_pat_`` or ``sk-svcacct-`` plus its 20-character minimum value).
+# Bounded readers use this as a private redaction lookahead before applying a
+# smaller model-visible output limit.
+_BARE_SENSITIVE_VALUE_MIN_CHARS = 31
 
 
 def redact_sensitive_values(value):

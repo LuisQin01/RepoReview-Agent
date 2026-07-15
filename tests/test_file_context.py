@@ -118,6 +118,37 @@ def test_read_file_context_skips_sensitive_files_without_reading_content(tmp_pat
     assert "sensitive" in context.error  # 拒绝原因必须可识别，便于下游与日志归类
 
 
+@pytest.mark.parametrize("sensitive_path", [".env", "config/settings.json"])
+def test_read_file_context_rejects_safe_alias_resolved_to_sensitive_target(
+    tmp_path, monkeypatch, sensitive_path
+):
+    """A safe-looking alias must not bypass the sensitive target check."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sensitive_target = repo / sensitive_path
+    sensitive_target.parent.mkdir(parents=True, exist_ok=True)
+    sensitive_target.write_text("TOKEN=DO_NOT_EXPOSE", encoding="utf-8")
+    alias = repo / "safe.txt"
+
+    # Model an in-repository symlink without requiring symlink privileges on Windows CI.
+    original_resolve = type(alias).resolve
+
+    def resolve_to_sensitive_target(path, *args, **kwargs):
+        if path == alias:
+            return sensitive_target
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(alias), "resolve", resolve_to_sensitive_target)
+
+    context = read_file_context(repo, "safe.txt", max_chars=100)
+
+    assert context.exists is False
+    assert context.content == ""
+    assert context.chars_read == 0
+    assert "sensitive" in context.error
+    assert "DO_NOT_EXPOSE" not in context.error
+
+
 def test_read_file_context_does_not_reject_non_sensitive_filename_containing_key(tmp_path):
     """验证 L1 黑名单的精确性：文件名仅「包含」敏感子串（如 "key"）不应被误判。
 

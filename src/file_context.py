@@ -449,8 +449,11 @@ def read_file_context(
             selection_reason=selection_reason,
         )
 
+    # Resolve the in-repository target before checking sensitivity: a benign
+    # alias must not make an in-repository sensitive file readable.
+    resolved_relative_path = target_path.relative_to(repo_root_path).as_posix()
     # 敏感文件拦截：L1 层防护，密钥/证书/部署配置不进入 LLM payload
-    if _is_sensitive_file_path(file_path):
+    if _is_sensitive_file_path(file_path) or _is_sensitive_file_path(resolved_relative_path):
         return _error_context(
             file_path,
             f"File {file_path} is sensitive and was not read",

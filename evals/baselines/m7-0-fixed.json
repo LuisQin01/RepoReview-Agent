@@ -1,0 +1,168 @@
+{
+  "commit": "4f5608e16ed76b0487d92b9388b5ed68243b8ca7",
+  "configuration": {
+    "cases": "evals/cases",
+    "context_budget": {
+      "max_extra_context_files": 3,
+      "max_prompt_chars": 4000
+    },
+    "llm_provider": "mock",
+    "repo": ".",
+    "use_llm": false
+  },
+  "environment": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python_version": "3.11.7 | packaged by Anaconda, Inc. | (main, Dec 15 2023, 18:05:47) [MSC v.1916 64 bit (AMD64)]"
+  },
+  "metrics": {
+    "average_duration_ms": 200.2,
+    "average_findings": 2.0,
+    "cases": 5,
+    "category_hit_rate": 0.4,
+    "f1": 0.6153846153846153,
+    "false_negative_count": 0,
+    "false_positive_count": 3,
+    "false_positive_rate": 0.0,
+    "json_valid_rate": 1.0,
+    "precision": 0.4444444444444444,
+    "recall": 1.0,
+    "results": [
+      {
+        "actual_categories": [],
+        "case_id": "clean_change_no_issue",
+        "duration_ms": 213,
+        "error": "",
+        "expected_categories": [],
+        "false_positive": false,
+        "findings_count": 0,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": true,
+        "json_valid": true,
+        "passed": true,
+        "tp": 0
+      },
+      {
+        "actual_categories": [
+          "exception_handling",
+          "test_gap"
+        ],
+        "case_id": "deleted_exception_handling",
+        "duration_ms": 222,
+        "error": "",
+        "expected_categories": [
+          "exception_handling"
+        ],
+        "false_positive": true,
+        "findings_count": 3,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "tp": 1
+      },
+      {
+        "actual_categories": [
+          "secret",
+          "test_gap"
+        ],
+        "case_id": "hardcoded_secret",
+        "duration_ms": 204,
+        "error": "",
+        "expected_categories": [
+          "secret"
+        ],
+        "false_positive": true,
+        "findings_count": 2,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "tp": 1
+      },
+      {
+        "actual_categories": [
+          "test_gap"
+        ],
+        "case_id": "missing_test",
+        "duration_ms": 183,
+        "error": "",
+        "expected_categories": [
+          "test_gap"
+        ],
+        "false_positive": false,
+        "findings_count": 1,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": true,
+        "tp": 1
+      },
+      {
+        "actual_categories": [
+          "debug",
+          "secret",
+          "sensitive_log",
+          "test_gap"
+        ],
+        "case_id": "sensitive_log",
+        "duration_ms": 179,
+        "error": "",
+        "expected_categories": [
+          "sensitive_log"
+        ],
+        "false_positive": true,
+        "findings_count": 4,
+        "fn": 0,
+        "fp": 3,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "tp": 1
+      }
+    ]
+  },
+  "observability": {
+    "llm_call_count": 0,
+    "token_usage": {
+      "available": false,
+      "reason": "fixed_pipeline_does_not_expose_token_usage"
+    }
+  },
+  "prerequisite_capabilities": {
+    "M2": {
+      "evidence": [
+        "src/file_context.py",
+        "tests/test_file_context.py"
+      ],
+      "status": "confirmed"
+    },
+    "M3": {
+      "evidence": [
+        "src/validation.py",
+        "tests/test_validation.py",
+        "tests/test_sensitive_leak.py"
+      ],
+      "status": "confirmed"
+    },
+    "M4": {
+      "evidence": [
+        "src/eval_runner.py",
+        "tests/test_eval_runner.py",
+        "src/trace.py",
+        "tests/test_trace.py"
+      ],
+      "status": "confirmed"
+    }
+  },
+  "reproduction": {
+    "command": "py -m src.eval_runner --cases evals/cases --repo . --baseline-output evals/baselines/m7-0-fixed.json --commit 4f5608e16ed76b0487d92b9388b5ed68243b8ca7 --worktree-state dirty"
+  },
+  "review_mode": "fixed",
+  "schema_version": "m7_fixed_baseline.v1",
+  "worktree_diff_sha256": "0cb025a6a24da08c600d3ed4e8894a130287b09b8df74d82bb10ca803db2edc0",
+  "worktree_state": "dirty"
+}

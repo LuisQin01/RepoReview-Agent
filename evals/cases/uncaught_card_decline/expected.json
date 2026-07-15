@@ -1,0 +1,20 @@
+{
+  "case_id": "uncaught_card_decline",
+  "expected_categories": ["exception_handling"],
+  "should_find": true,
+  "expected_findings": [
+    {
+      "file": "api/checkout.py",
+      "line": 2,
+      "category": "exception_handling",
+      "message": "CardDeclined escapes the checkout endpoint instead of being translated to the documented client error."
+    }
+  ],
+  "repository_context": {
+    "root": "repository_context",
+    "required_paths": ["docs/payment-contract.md"],
+    "fixed_missing_evidence": "The fixed collector only reads changed files plus Python import/call-name candidates; it does not enumerate this Markdown API contract, so the required CardDeclined-to-422 translation is unavailable to it.",
+    "react_required_tool": "read_file_context",
+    "manual_verification": "The added line calls an injected processor without a CardDeclined handler. The contract requires this endpoint to convert that exception to HTTP 422, so uncaught propagation is a real client-visible defect."
+  }
+}

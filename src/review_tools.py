@@ -6,16 +6,19 @@ deterministic dispatch. Model integration belongs to later milestones.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import ast
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Collection, Protocol, Sequence, TypeAlias, runtime_checkable
 
-from .file_context import _is_sensitive_file_path, read_file_context
-from .schemas import ChangedFile, DiffHunk
+from .file_context import _is_sensitive_file_path, locate_python_symbol, read_file_context
+from .llm_reviewer import parse_llm_response
+from .schemas import ChangedFile, DiffHunk, ReviewIssue
 from .trace import _BARE_SENSITIVE_VALUE_MIN_CHARS, redact_sensitive_values
+from .validation import validate_issue_locations
 
 
 JSONValue: TypeAlias = (
@@ -246,6 +249,154 @@ class ToolDispatcher:
             result_size=0,
             result_limit=0,
         )
+
+
+@dataclass(frozen=True)
+class FinishResult:
+    """The only normal-review termination result exposed to a controller.
+
+    ``findings`` contains only issues that passed the existing schema and
+    location validation chain.  ``truncated`` means the result is incomplete,
+    never that no omitted finding exists.
+    """
+
+    finished: bool
+    status: str
+    findings: tuple[ReviewIssue, ...]
+    finding_count: int
+    finding_limit: int
+    received_count: int
+    rejected_count: int
+    truncated: bool
+
+
+class FinishReview:
+    """Accept one validated ``finish_review`` call for a single review.
+
+    A well-formed call terminates even when every supplied candidate is
+    rejected, so untrusted model text can never become an implicit finding.
+    Invalid top-level arguments do not terminate and return
+    ``status="invalid_arguments"``.  Once finished, first finish wins and
+    later calls return the original result with ``status="already_finished"``.
+    """
+
+    name = "finish_review"
+    description = "Terminate the review and return only validated final findings."
+    parameters_schema: JSONSchema = {
+        "type": "object",
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string"},
+                        "line": {"type": "integer"},
+                        "severity": {"type": "string"},
+                        "issue": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "suggested_fix": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": [
+                        "file",
+                        "line",
+                        "severity",
+                        "issue",
+                        "reason",
+                        "suggested_fix",
+                        "confidence",
+                        "evidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["findings"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, changed_files: Sequence[ChangedFile], *, max_findings: int = 50) -> None:
+        """Create a per-review termination gate bound to immutable diff locations."""
+        if max_findings <= 0:
+            raise ValueError("finish_review_max_findings_must_be_positive")
+        self._changed_files = tuple(changed_files)
+        self._max_findings = max_findings
+        self._result: FinishResult | None = None
+
+    @property
+    def is_finished(self) -> bool:
+        """Return whether a controller must stop dispatching later tool calls."""
+        return self._result is not None
+
+    def finish(self, arguments: JSONValue) -> FinishResult:
+        """Validate one terminal call without treating ordinary model text as a finding."""
+        if self._result is not None:
+            return replace(self._result, status="already_finished")
+        if not self._arguments_are_valid(arguments):
+            return FinishResult(
+                finished=False,
+                status="invalid_arguments",
+                findings=(),
+                finding_count=0,
+                finding_limit=self._max_findings,
+                received_count=0,
+                rejected_count=0,
+                truncated=False,
+            )
+
+        candidates = arguments["findings"]
+        assert isinstance(candidates, list)  # Narrowed by _arguments_are_valid().
+        truncated = len(candidates) > self._max_findings
+        accepted: list[ReviewIssue] = []
+        rejected_count = 0
+        for candidate in candidates[: self._max_findings]:
+            issue = self._validated_issue(candidate)
+            if issue is None:
+                rejected_count += 1
+            else:
+                accepted.append(issue)
+
+        # The first finish is immutable so a later model turn cannot replace reviewed output.
+        self._result = FinishResult(
+            finished=True,
+            status="finished",
+            findings=tuple(accepted),
+            finding_count=len(accepted),
+            finding_limit=self._max_findings,
+            received_count=len(candidates),
+            rejected_count=rejected_count,
+            truncated=truncated,
+        )
+        return self._result
+
+    def _arguments_are_valid(self, arguments: JSONValue) -> bool:
+        """Admit only the declared terminal-call envelope."""
+        return (
+            isinstance(arguments, dict)
+            and set(arguments) == {"findings"}
+            and isinstance(arguments["findings"], list)
+        )
+
+    def _validated_issue(self, candidate: JSONValue) -> ReviewIssue | None:
+        """Return one strict, locatable finding through the existing validation chain."""
+        # One malformed candidate must not invalidate other terminal findings.
+        if not ToolDispatcher._arguments_match_schema(
+            {"findings": [candidate]}, self.parameters_schema
+        ):
+            return None
+        try:
+            response_text = json.dumps({"findings": [candidate]}, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        issues, validation = parse_llm_response(response_text)
+        if not validation.valid or validation.repaired or len(issues) != 1:
+            return None
+
+        issue = validate_issue_locations(issues, self._changed_files)[0]
+        # A summary downgrade is safe for the legacy pipeline but not for an explicit terminal finding.
+        return issue if issue.placement == "inline" else None
 
 
 _HUNK_HEADER_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -480,6 +631,116 @@ class ReadFileContextTool:
         )
 
 
+class SearchPythonSymbolTool:
+    """Locate one Python symbol for a changed line within an explicit review scope.
+
+    The tool returns location metadata only.  It deliberately does not return a
+    symbol's source because locating a symbol must not expand the model's file
+    read capability beyond this bounded lookup.
+    """
+
+    name = "search_python_symbol"
+    description = "Locate the Python function, method, or class containing one scoped line."
+    parameters_schema: JSONSchema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "line_no": {"type": "integer"},
+        },
+        "required": ["path", "line_no"],
+        "additionalProperties": False,
+    }
+
+    def __init__(
+        self,
+        repo_root: str | Path,
+        review_scope: Collection[str],
+        *,
+        max_source_chars: int = 200_000,
+    ) -> None:
+        """Create a scoped symbol locator with a fixed source parsing budget."""
+        if max_source_chars <= 0:
+            raise ValueError("python_symbol_max_source_chars_must_be_positive")
+        self._repo_root = Path(repo_root).resolve()
+        self._review_scope = frozenset(_normalize_review_path(path) for path in review_scope)
+        self._max_source_chars = max_source_chars
+
+    def run(self, arguments: dict[str, JSONValue]) -> ToolResult:
+        """Return one containing symbol without exposing source text or I/O diagnostics."""
+        path = arguments.get("path") if isinstance(arguments, dict) else None
+        line_no = arguments.get("line_no") if isinstance(arguments, dict) else None
+        if not isinstance(path, str) or not isinstance(line_no, int) or isinstance(line_no, bool):
+            return _python_symbol_failure("invalid_arguments", "A string path and integer line number are required.")
+        if line_no < 1:
+            return _python_symbol_failure("invalid_arguments", "The line number must be positive.")
+        try:
+            normalized_path = _normalize_file_context_path(path)
+            target_path = (self._repo_root / normalized_path).resolve()
+            target_path.relative_to(self._repo_root)
+        except ValueError:
+            return _python_symbol_failure("forbidden", "The requested path is outside the review scope.")
+
+        resolved_relative_path = target_path.relative_to(self._repo_root).as_posix()
+        if normalized_path not in self._review_scope or resolved_relative_path not in self._review_scope:
+            return _python_symbol_failure("forbidden", "The requested path is outside the review scope.")
+        if _is_sensitive_file_path(normalized_path) or _is_sensitive_file_path(resolved_relative_path):
+            return _python_symbol_failure("forbidden", "The requested path is not available to this tool.")
+        if target_path.suffix.lower() != ".py":
+            return _python_symbol_failure("unsupported", "Only Python source files are supported.")
+        if not target_path.exists():
+            return _python_symbol_failure("not_found", "The requested file was not found.")
+        if target_path.is_dir():
+            return _python_symbol_failure("unavailable", "The requested path cannot be parsed as a Python file.")
+
+        try:
+            with target_path.open("r", encoding="utf-8") as source_file:
+                source = source_file.read(self._max_source_chars + 1)
+        except (OSError, UnicodeError):
+            return _python_symbol_failure("unavailable", "The requested file could not be read.")
+        if len(source) > self._max_source_chars:
+            # A partial AST can make an absent tail look like a real negative result.
+            return _python_symbol_failure(
+                "unavailable",
+                "The Python source exceeds this tool's parsing limit.",
+                truncated=True,
+                source_chars_read=len(source),
+                source_char_limit=self._max_source_chars,
+            )
+
+        try:
+            ast.parse(source)
+        except (SyntaxError, ValueError):
+            # locate_python_symbol intentionally collapses this for file-context fallback.
+            return _python_symbol_failure("unavailable", "The Python source could not be parsed.")
+        symbol = locate_python_symbol(source, line_no)
+        if symbol is None:
+            return _python_symbol_failure("not_found", "No Python symbol contains the requested line.")
+
+        return ToolResult(
+            success=True,
+            model_summary="Located one Python symbol for the requested line.",
+            error_code=None,
+            truncated=False,
+            result_size=1,
+            result_limit=1,
+            data={
+                "path": resolved_relative_path,
+                "name": symbol.name,
+                "kind": symbol.kind,
+                "qualified_name": symbol.qualified_name,
+                "class_name": symbol.class_name,
+                "start_line": symbol.start_line,
+                "end_line": symbol.end_line,
+            },
+            usage={
+                "symbols_returned": 1,
+                "symbol_limit": 1,
+                "source_chars_read": len(source),
+                "source_char_limit": self._max_source_chars,
+            },
+        )
+
+
 def _normalize_review_path(path: str) -> str:
     """Accept only a canonical relative POSIX path without traversal components."""
     if not isinstance(path, str) or not path or path != path.strip():
@@ -580,4 +841,29 @@ def _file_context_failure(error_code: str, summary: str) -> ToolResult:
         result_size=0,
         result_limit=0,
         usage={"characters_returned": 0},
+    )
+
+
+def _python_symbol_failure(
+    error_code: str,
+    summary: str,
+    *,
+    truncated: bool = False,
+    source_chars_read: int = 0,
+    source_char_limit: int = 0,
+) -> ToolResult:
+    """Create a safe symbol lookup failure while preserving incomplete-input state."""
+    return ToolResult(
+        success=False,
+        model_summary=summary,
+        error_code=error_code,
+        truncated=truncated,
+        result_size=0,
+        result_limit=1,
+        usage={
+            "symbols_returned": 0,
+            "symbol_limit": 1,
+            "source_chars_read": source_chars_read,
+            "source_char_limit": source_char_limit,
+        },
     )

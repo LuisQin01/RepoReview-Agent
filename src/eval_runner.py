@@ -148,6 +148,48 @@ def load_expected(case_dir: Path):
     expected_path = case_dir / "expected.json"
     return json.loads(expected_path.read_text(encoding="utf-8"))
 
+
+def _resolve_case_repo_root(case_dir: Path, expected: dict, default_repo_root: Path) -> Path:
+    """Return a case-owned repository fixture or preserve the caller's root.
+
+    ``repository_context`` is optional so existing cases keep their established
+    caller-provided repository.  A declared fixture is validated before it is
+    passed to the review pipeline, preventing a case manifest from reading
+    outside its own directory.
+    """
+    context = expected.get("repository_context")
+    if context is None:
+        return Path(default_repo_root)
+    if not isinstance(context, dict):
+        raise ValueError("invalid_arguments")
+
+    root = context.get("root")
+    required_paths = context.get("required_paths", [])
+    if not isinstance(root, str) or not isinstance(required_paths, list):
+        raise ValueError("invalid_arguments")
+
+    case_root = case_dir.resolve()
+    fixture_root = (case_root / root).resolve()
+    try:
+        fixture_root.relative_to(case_root)
+    except ValueError as exc:
+        raise ValueError("forbidden") from exc
+    if not fixture_root.is_dir():
+        raise ValueError("not_found")
+
+    for required_path in required_paths:
+        if not isinstance(required_path, str):
+            raise ValueError("invalid_arguments")
+        required_file = (fixture_root / required_path).resolve()
+        try:
+            required_file.relative_to(fixture_root)
+        except ValueError as exc:
+            raise ValueError("forbidden") from exc
+        if not required_file.is_file():
+            raise ValueError("not_found")
+
+    return fixture_root
+
 def extract_categories(findings):
     """从 findings 列表中提取类别（category）集合。
 
@@ -241,11 +283,12 @@ def run_one_case(
     """
     expected = load_expected(case_dir)
     context_budget = context_budget or ContextBudget()
+    effective_repo_root = _resolve_case_repo_root(case_dir, expected, repo_root)
 
     # 构造审查请求：每个 case 以 input.diff 作为输入
     request = ReviewRequest(
         diff_path=str(case_dir / "input.diff"),
-        repo_root=str(repo_root),
+        repo_root=str(effective_repo_root),
         output_format="json",
         use_llm=use_llm,
         context_budget=context_budget,

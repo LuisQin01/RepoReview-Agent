@@ -19,6 +19,7 @@ precision / recall / f1 / hit_rate / false_positive_rate 等指标。
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,9 @@ from types import SimpleNamespace
 import pytest
 
 from src import eval_runner
+from src.diff_parser import parse_diff
+from src.file_context import collect_file_contexts
+from src.reviewers import review_changed_files
 from src.review_service import ReviewRequest
 from src.schemas import ContextBudget, ReviewIssue
 
@@ -88,6 +92,131 @@ def install_review_service(monkeypatch, findings):
 
     monkeypatch.setattr(eval_runner, "ReviewService", FakeReviewService)
     return requests
+
+
+def test_cross_file_case_ground_truth_requires_context_and_survives_rename(
+    tmp_path, monkeypatch
+):
+    """The cross-file case must rely on its evidence, never on its directory name."""
+    case_dir = (
+        Path(__file__).resolve().parent.parent
+        / "evals"
+        / "cases"
+        / "uncaught_card_decline"
+    )
+    expected = json.loads((case_dir / "expected.json").read_text(encoding="utf-8"))
+    repository_root = case_dir / "repository_context"
+
+    changed_files = parse_diff((case_dir / "input.diff").read_text(encoding="utf-8"))
+    expected_finding = expected["expected_findings"][0]
+    assert (
+        expected_finding["file"],
+        expected_finding["line"],
+        expected_finding["category"],
+    ) == ("api/checkout.py", 2, "exception_handling")
+    assert any(
+        line.file_path == expected_finding["file"]
+        and line.line_no == expected_finding["line"]
+        for changed_file in changed_files
+        for line in changed_file.added_lines
+    )
+    assert review_changed_files(changed_files) == []
+
+    contexts = collect_file_contexts(
+        repository_root,
+        changed_files,
+        ContextBudget(max_prompt_chars=4000, max_extra_context_files=3),
+    )
+    # The contract is intentionally non-Python: fixed collection cannot infer it.
+    assert "docs/payment-contract.md" not in {context.path for context in contexts}
+    contract = (repository_root / "docs" / "payment-contract.md").read_text(
+        encoding="utf-8"
+    )
+    assert "CardDeclined" in contract and "HTTP\n422" in contract
+
+    renamed_case = tmp_path / "renamed-without-answer"
+    shutil.copytree(case_dir, renamed_case)
+    caller_repository_root = tmp_path / "caller-repository"
+    caller_repository_root.mkdir()
+
+    class EvidenceOnlyReviewService:
+        def review(self, request):
+            assert Path(request.repo_root) == (
+                renamed_case / "repository_context"
+            ).resolve()
+            diff_text = Path(request.diff_path).read_text(encoding="utf-8")
+            context_text = (
+                Path(request.repo_root) / "docs" / "payment-contract.md"
+            ).read_text(encoding="utf-8")
+            assert "processor.charge_card(amount)" in diff_text
+            assert "CardDeclined" in context_text
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    issues=[
+                        ReviewIssue(
+                            "api/checkout.py",
+                            2,
+                            "warning",
+                            "exception_handling",
+                            "Unhandled CardDeclined",
+                            "Translate CardDeclined to HTTP 422.",
+                        )
+                    ]
+                )
+            )
+
+    monkeypatch.setattr(eval_runner, "ReviewService", EvidenceOnlyReviewService)
+    result = eval_runner.run_one_case(renamed_case, caller_repository_root)
+
+    assert result["case_id"] == "uncaught_card_decline"
+    assert result["passed"] is True
+
+
+def test_run_one_case_keeps_caller_repo_root_for_legacy_cases(tmp_path, monkeypatch):
+    """Cases without repository_context must preserve the existing runner contract."""
+    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
+    caller_repository_root = tmp_path / "caller-repository"
+    caller_repository_root.mkdir()
+
+    class FakeReviewService:
+        def review(self, request):
+            assert Path(request.repo_root) == caller_repository_root
+            return SimpleNamespace(state=SimpleNamespace(issues=[]))
+
+    monkeypatch.setattr(eval_runner, "ReviewService", FakeReviewService)
+
+    result = eval_runner.run_one_case(case_dir, caller_repository_root)
+
+    assert result["passed"] is True
+
+
+def test_run_one_case_rejects_case_context_path_escape(tmp_path, monkeypatch):
+    """A case manifest cannot redirect repository reads outside its own fixture."""
+    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
+    (case_dir / "expected.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case",
+                "expected_categories": [],
+                "should_find": False,
+                "repository_context": {"root": "../outside", "required_paths": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    called = []
+
+    class UnexpectedReviewService:
+        def review(self, request):
+            called.append(request)
+            raise AssertionError("invalid case context must not reach ReviewService")
+
+    monkeypatch.setattr(eval_runner, "ReviewService", UnexpectedReviewService)
+
+    with pytest.raises(ValueError, match="forbidden"):
+        eval_runner.run_one_case(case_dir, tmp_path)
+
+    assert called == []
 
 
 def test_extract_categories_prefers_category_and_falls_back_to_reason():

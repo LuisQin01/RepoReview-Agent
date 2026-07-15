@@ -8,9 +8,11 @@ import pytest
 from src.diff_parser import parse_diff
 from src.review_tools import (
     ChangedHunksTool,
+    FinishReview,
     INTERNAL_ERROR_CODE,
     ReadFileContextTool,
     ReviewTool,
+    SearchPythonSymbolTool,
     ToolDispatcher,
     ToolResult,
 )
@@ -293,6 +295,131 @@ def test_dispatcher_returns_structured_failure_for_invalid_tool_names(tool_name)
 
     assert result.success is False
     assert result.error_code == "invalid_arguments"
+
+
+def _finish_changed_files():
+    return [
+        ChangedFile(
+            path="src/app.py",
+            added_lines=[],
+            deleted_lines=[],
+            patch="@@ -10 +10 @@\n+value = True",
+            hunks=[DiffHunk(start_line=10, end_line=10)],
+        )
+    ]
+
+
+def _valid_finish_finding():
+    return {
+        "file": "src/app.py",
+        "line": 10,
+        "severity": "high",
+        "issue": "Unchecked result",
+        "reason": "The call may fail.",
+        "suggested_fix": "Handle the failure.",
+        "confidence": 0.9,
+        "evidence": "The changed call has no check.",
+    }
+
+
+def test_finish_review_terminates_with_only_existing_validator_output():
+    finish = FinishReview(_finish_changed_files())
+
+    result = finish.finish({"findings": [_valid_finish_finding()]})
+
+    assert result.finished is True
+    assert result.status == "finished"
+    assert finish.is_finished is True
+    assert result.finding_count == 1
+    assert result.rejected_count == 0
+    assert result.findings[0].source == "llm"
+    assert result.findings[0].placement == "inline"
+
+
+def test_finish_review_safely_terminates_with_an_empty_result():
+    finish = FinishReview(_finish_changed_files())
+
+    result = finish.finish({"findings": []})
+
+    assert result.finished is True
+    assert result.findings == ()
+    assert result.finding_count == 0
+    assert result.received_count == 0
+    assert result.truncated is False
+
+
+def test_finish_review_filters_repaired_or_unlocatable_findings_from_terminal_output():
+    finish = FinishReview(_finish_changed_files())
+    missing_required_field = _valid_finish_finding()
+    missing_required_field.pop("issue")
+    outside_changed_hunk = _valid_finish_finding()
+    outside_changed_hunk["line"] = 11
+    string_line = {**_valid_finish_finding(), "line": "10"}
+    string_confidence = {**_valid_finish_finding(), "confidence": "0.9"}
+    unexpected_field = {**_valid_finish_finding(), "unexpected": True}
+
+    result = finish.finish(
+        {
+            "findings": [
+                _valid_finish_finding(),
+                missing_required_field,
+                outside_changed_hunk,
+                string_line,
+                string_confidence,
+                unexpected_field,
+            ]
+        }
+    )
+
+    assert result.finished is True
+    assert result.finding_count == 1
+    assert result.rejected_count == 5
+    assert result.findings == (result.findings[0],)
+    assert result.findings[0].line_no == 10
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"findings": "not-a-list"},
+        {"findings": [_valid_finish_finding()], "extra": True},
+    ],
+)
+def test_finish_review_invalid_arguments_do_not_terminate_the_review(arguments):
+    finish = FinishReview(_finish_changed_files())
+
+    result = finish.finish(arguments)
+
+    assert result.finished is False
+    assert result.status == "invalid_arguments"
+    assert result.findings == ()
+    assert finish.is_finished is False
+
+
+def test_finish_review_is_first_finish_wins_and_signals_no_more_tool_dispatch():
+    finish = FinishReview(_finish_changed_files())
+    first = finish.finish({"findings": []})
+
+    repeated = finish.finish({"findings": [_valid_finish_finding()]})
+
+    assert first.status == "finished"
+    assert repeated.finished is True
+    assert repeated.status == "already_finished"
+    assert repeated.findings == ()
+    assert repeated.finding_count == 0
+    assert finish.is_finished is True
+
+
+def test_finish_review_marks_over_limit_output_as_incomplete():
+    finish = FinishReview(_finish_changed_files(), max_findings=1)
+
+    result = finish.finish({"findings": [_valid_finish_finding(), _valid_finish_finding()]})
+
+    assert result.finished is True
+    assert result.finding_count == 1
+    assert result.finding_limit == 1
+    assert result.received_count == 2
+    assert result.truncated is True
 
 
 def _parse_fixture(name):
@@ -597,3 +724,97 @@ def test_read_file_context_tool_returns_recoverable_not_found_for_missing_file(t
     assert result.success is False
     assert result.error_code == "not_found"
     assert result.data is None
+
+
+def test_search_python_symbol_tool_returns_function_class_and_method_locations(tmp_path):
+    source = tmp_path / "src" / "symbols.py"
+    source.parent.mkdir()
+    source.write_text(
+        "def top_level():\n"
+        "    return 1\n"
+        "\n"
+        "class Processor:\n"
+        "    setting = 1\n"
+        "\n"
+        "    def handle(self):\n"
+        "        return self.setting\n",
+        encoding="utf-8",
+    )
+    tool = SearchPythonSymbolTool(tmp_path, {"src/symbols.py"})
+    dispatcher = ToolDispatcher()
+    dispatcher.register(tool)
+
+    function = dispatcher.dispatch("search_python_symbol", {"path": "src/symbols.py", "line_no": 2})
+    containing_class = dispatcher.dispatch("search_python_symbol", {"path": "src/symbols.py", "line_no": 5})
+    method = dispatcher.dispatch("search_python_symbol", {"path": "src/symbols.py", "line_no": 8})
+
+    assert function.data == {
+        "path": "src/symbols.py",
+        "name": "top_level",
+        "kind": "function",
+        "qualified_name": "top_level",
+        "class_name": None,
+        "start_line": 1,
+        "end_line": 2,
+    }
+    assert containing_class.data["kind"] == "class"
+    assert containing_class.data["qualified_name"] == "Processor"
+    assert method.data["kind"] == "method"
+    assert method.data["qualified_name"] == "Processor.handle"
+    assert method.data["start_line"] == 7
+    assert method.data["end_line"] == 8
+    assert all(result.success and result.result_size == result.result_limit == 1 for result in (function, containing_class, method))
+    assert "source" not in method.data
+
+
+def test_search_python_symbol_tool_distinguishes_not_found_parse_failure_and_truncation(tmp_path):
+    source = tmp_path / "symbols.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    tool = SearchPythonSymbolTool(tmp_path, {"symbols.py"}, max_source_chars=20)
+
+    not_found = tool.run({"path": "symbols.py", "line_no": 1})
+    source.write_text("def broken(:\n", encoding="utf-8")
+    parse_failure = tool.run({"path": "symbols.py", "line_no": 1})
+    source.write_text("def very_long_name():\n    return 1\n", encoding="utf-8")
+    truncated = tool.run({"path": "symbols.py", "line_no": 2})
+
+    assert (not_found.success, not_found.error_code, not_found.truncated) == (False, "not_found", False)
+    assert (parse_failure.success, parse_failure.error_code, parse_failure.truncated) == (False, "unavailable", False)
+    assert (truncated.success, truncated.error_code, truncated.truncated) == (False, "unavailable", True)
+    assert truncated.usage["source_char_limit"] == 20
+    assert truncated.usage["source_chars_read"] == 21
+
+
+def test_search_python_symbol_tool_rejects_non_python_and_out_of_scope_paths(tmp_path):
+    (tmp_path / "symbols.py").write_text("def visible():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("not python\n", encoding="utf-8")
+    tool = SearchPythonSymbolTool(tmp_path, {"symbols.py", "notes.txt"})
+
+    non_python = tool.run({"path": "notes.txt", "line_no": 1})
+    traversal = tool.run({"path": "../symbols.py", "line_no": 1})
+    out_of_scope = tool.run({"path": "other.py", "line_no": 1})
+
+    assert (non_python.success, non_python.error_code) == (False, "unsupported")
+    assert (traversal.success, traversal.error_code) == (False, "forbidden")
+    assert (out_of_scope.success, out_of_scope.error_code) == (False, "forbidden")
+
+
+def test_search_python_symbol_tool_rejects_symlink_escape_from_repository_and_scope(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-symbols.py"
+    outside.write_text("def secret():\n    return 1\n", encoding="utf-8")
+    alias = tmp_path / "alias.py"
+    tool = SearchPythonSymbolTool(tmp_path, {"alias.py"})
+
+    original_resolve = type(alias).resolve
+
+    def resolve_with_escape(path, *args, **kwargs):
+        if path == alias:
+            return outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(alias), "resolve", resolve_with_escape)
+
+    result = tool.run({"path": "alias.py", "line_no": 1})
+
+    assert (result.success, result.error_code) == (False, "forbidden")
+    assert "secret" not in json.dumps(result.to_model_dict())

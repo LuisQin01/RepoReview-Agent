@@ -70,6 +70,35 @@ M7_FIXED_BASELINE_PREREQUISITES = {
 }
 
 
+def _output_exclusion_paths(output_path: str | Path) -> tuple[str | Path, ...]:
+    """Return the output file plus its parent directory for untracked exclusion.
+
+    The parent directory is included so an existing untracked sibling output in
+    the same directory does not block regenerating a new sibling output (for
+    example, rerunning ``--comparison-output evals/comparisons/m7-18.json``
+    while a previously generated ``evals/comparisons/m7-18-prev.json`` is still
+    untracked).  The parent directory is only returned when it is a proper
+    sub-directory of the repository root; excluding the repository root itself
+    would silently mask every untracked file and is never the caller's intent.
+    """
+    output = Path(output_path)
+    parent = output.resolve().parent
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        parent_relative = parent.relative_to(repo_root.resolve())
+    except ValueError:
+        # Output lives outside the repository; only the file itself can be
+        # excluded, since untracked in-repo paths are not influenced by it.
+        return (output,)
+    if parent_relative == Path("."):
+        # The output sits at the repository root; excluding the whole root
+        # would mask all untracked files, so fall back to the file only.
+        return (output,)
+    # Mark the directory entry with a trailing separator so the snapshot
+    # logic can distinguish exact-file matches from directory-prefix matches.
+    return (output, parent_relative.as_posix() + "/")
+
+
 def capture_source_revision(
     repo_root: Path,
     *,
@@ -82,6 +111,14 @@ def capture_source_revision(
     diff is fingerprinted so it cannot be confused with a clean commit.  The
     current baseline output may be excluded when it is an untracked file inside
     the repository: it is generated after this snapshot and is not source input.
+
+    ``excluded_untracked_paths`` accepts both exact file paths and directory
+    prefixes (marked with a trailing ``/``).  A directory prefix excludes every
+    untracked entry whose path starts with that prefix, so previously generated
+    sibling outputs under the same directory do not block regenerating a new
+    output in that directory.  Exact file matches continue to exclude only the
+    named file, preserving the established single-output rerun contract for
+    callers that do not opt into the directory-prefix form.
     """
     def git_output(*arguments: str) -> bytes:
         try:
@@ -99,22 +136,37 @@ def capture_source_revision(
 
     repo_root = repo_root.resolve()
     excluded_paths = set()
+    excluded_dir_prefixes = set()
     for path in excluded_untracked_paths:
-        try:
-            excluded_path = Path(path).resolve().relative_to(repo_root)
-        except ValueError:
-            continue
-        excluded_paths.add(excluded_path.as_posix().encode("utf-8"))
+        text = str(path)
+        if text.endswith("/"):
+            # Directory-prefix form: exclude any untracked entry under this dir.
+            try:
+                relative = Path(text[:-1]).resolve().relative_to(repo_root)
+            except ValueError:
+                continue
+            excluded_dir_prefixes.add(relative.as_posix().encode("utf-8") + b"/")
+        else:
+            # Exact-file form: exclude only this specific untracked path.
+            try:
+                excluded_path = Path(text).resolve().relative_to(repo_root)
+            except ValueError:
+                continue
+            excluded_paths.add(excluded_path.as_posix().encode("utf-8"))
+
+    def _is_excluded_untracked(entry: bytes) -> bool:
+        if not entry.startswith(b"?? "):
+            return False
+        path = entry[3:]
+        if path in excluded_paths:
+            return True
+        return any(path.startswith(prefix) for prefix in excluded_dir_prefixes)
 
     commit = git_output("rev-parse", "HEAD").decode("ascii").strip()
     status = git_output("status", "--porcelain=v1", "-z", "--untracked-files=all")
     status_entries = [entry for entry in status.split(b"\0") if entry]
     retained_status_entries = [
-        entry
-        for entry in status_entries
-        if not (
-            entry.startswith(b"?? ") and entry[3:] in excluded_paths
-        )
+        entry for entry in status_entries if not _is_excluded_untracked(entry)
     ]
     if not retained_status_entries:
         return SourceRevision(
@@ -584,7 +636,7 @@ def main():
     if args.baseline_output:
         source_revision = capture_source_revision(
             Path(__file__).resolve().parent.parent,
-            excluded_untracked_paths=(args.baseline_output,),
+            excluded_untracked_paths=_output_exclusion_paths(args.baseline_output),
         )
         if args.commit != "unknown" and args.commit != source_revision.commit:
             raise ValueError("fixed_baseline_commit_mismatch")

@@ -983,3 +983,113 @@ def test_cli_reports_unsupported_without_traceback_or_absolute_paths(tmp_path):
     assert "Traceback" not in completed.stderr
     assert str(repo_root) not in completed.stderr
     assert str(workspace_root) not in completed.stderr
+
+
+def test_output_exclusion_paths_returns_parent_dir_for_in_repo_output(monkeypatch, tmp_path):
+    """The helper must exclude the output file plus its in-repo parent directory.
+
+    Why: regenerating ``evals/comparisons/m7-18.json`` while a previously
+    generated sibling such as ``evals/comparisons/m7-18-prev.json`` is still
+    untracked must not be blocked by that sibling.  Returning the parent
+    directory (``evals/comparisons/``) as a prefix exclusion lets the snapshot
+    logic mask every untracked sibling under that directory.
+    """
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(
+        eval_runner, "__file__", str(repo_root / "src" / "eval_runner.py")
+    )
+
+    excluded = eval_runner._output_exclusion_paths("evals/comparisons/m7-18.json")
+
+    assert excluded[0] == Path("evals/comparisons/m7-18.json")
+    assert excluded[1] == "evals/comparisons/"
+
+
+def test_output_exclusion_paths_falls_back_to_file_only_at_repo_root(monkeypatch, tmp_path):
+    """An output at the repository root must not exclude every untracked file."""
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(
+        eval_runner, "__file__", str(repo_root / "src" / "eval_runner.py")
+    )
+
+    excluded = eval_runner._output_exclusion_paths("baseline.json")
+
+    assert excluded == (Path("baseline.json"),)
+
+
+def test_capture_source_revision_excludes_untracked_sibling_outputs_under_same_dir(
+    monkeypatch, tmp_path
+):
+    """An existing untracked sibling output must not block regenerating a new one.
+
+    Trigger: ``excluded_untracked_paths`` includes both the exact output file
+    and its parent directory prefix.  An untracked sibling under that prefix
+    must be filtered out so the snapshot can proceed and fingerprint the
+    tracked diff.
+    """
+    monkeypatch.chdir(tmp_path)
+    outputs = iter(
+        (
+            b"abc123\n",
+            b"?? evals/comparisons/m7-18-prev.json\x00 M src/eval_runner.py\n",
+            b"diff --git a/x b/x\n",
+        )
+    )
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(outputs))
+
+    monkeypatch.setattr(eval_runner.subprocess, "run", fake_run)
+
+    revision = eval_runner.capture_source_revision(
+        tmp_path,
+        excluded_untracked_paths=(
+            "evals/comparisons/m7-18.json",
+            "evals/comparisons/",
+        ),
+    )
+
+    assert revision.commit == "abc123"
+    assert revision.worktree_state == "dirty"
+    assert revision.worktree_diff_sha256 == (
+        "1a059963bbf3198857755a48c741d351e21515186ce951464b89a0de0797c081"
+    )
+
+
+def test_capture_source_revision_still_rejects_untracked_source_outside_output_dir(
+    monkeypatch, tmp_path
+):
+    """Untracked source outside the output directory must still raise unsupported.
+
+    Why: the directory-prefix relaxation is scoped to the output's parent
+    directory only.  An untracked case file under ``evals/cases/`` is genuine
+    source input and must continue to trigger ``unsupported`` so the snapshot
+    cannot misidentify the measured source.
+    """
+    monkeypatch.chdir(tmp_path)
+    outputs = iter(
+        (
+            b"abc123\n",
+            b"?? evals/cases/new-case/expected.json\n",
+        )
+    )
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(outputs))
+
+    monkeypatch.setattr(eval_runner.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="unsupported"):
+        eval_runner.capture_source_revision(
+            tmp_path,
+            excluded_untracked_paths=(
+                "evals/comparisons/m7-18.json",
+                "evals/comparisons/",
+            ),
+        )
+
+

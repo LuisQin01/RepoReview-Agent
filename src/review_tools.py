@@ -12,7 +12,12 @@ from hashlib import sha256
 import json
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Collection, Protocol, Sequence, TypeAlias, runtime_checkable
+from typing import Collection, Dict, List, Protocol, Sequence, Union, runtime_checkable
+
+try:  # TypeAlias was added in Python 3.10.
+    from typing import TypeAlias
+except ImportError:  # pragma: no cover - exercised on Python < 3.10
+    TypeAlias = None  # type: ignore[assignment,misc]
 
 from .file_context import _is_sensitive_file_path, locate_python_symbol, read_file_context
 from .llm_reviewer import parse_llm_response
@@ -21,10 +26,10 @@ from .trace import _BARE_SENSITIVE_VALUE_MIN_CHARS, redact_sensitive_values
 from .validation import validate_issue_locations
 
 
-JSONValue: TypeAlias = (
-    None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
-)
-JSONSchema: TypeAlias = dict[str, JSONValue]
+JSONValue: TypeAlias = Union[
+    None, bool, int, float, str, List["JSONValue"], Dict[str, "JSONValue"]
+]
+JSONSchema: TypeAlias = Dict[str, JSONValue]
 
 EXPECTED_TOOL_ERROR_CODES = frozenset(
     {
@@ -253,10 +258,11 @@ class ToolDispatcher:
 
 @dataclass(frozen=True)
 class FinishResult:
-    """The only normal-review termination result exposed to a controller.
+    """The validated result shape exposed by a controller at termination.
 
     ``findings`` contains only issues that passed the existing schema and
-    location validation chain.  ``truncated`` means the result is incomplete,
+    location validation chain.  ``finished=False`` denotes a non-finish
+    degradation; ``truncated`` means the result is incomplete,
     never that no omitted finding exists.
     """
 
@@ -298,6 +304,7 @@ class FinishReview:
                         "suggested_fix": {"type": "string"},
                         "confidence": {"type": "number"},
                         "evidence": {"type": "string"},
+                        "category": {"type": "string"},
                     },
                     "required": [
                         "file",
@@ -393,6 +400,16 @@ class FinishReview:
         issues, validation = parse_llm_response(response_text)
         if not validation.valid or validation.repaired or len(issues) != 1:
             return None
+
+        # parse_llm_response assigns category="llm" uniformly.  A terminal
+        # finding may carry an explicit review category (e.g.
+        # exception_handling), so preserve the candidate's category when
+        # present instead of forcing every finish_review finding to "llm".
+        candidate_category = (
+            candidate.get("category") if isinstance(candidate, dict) else None
+        )
+        if isinstance(candidate_category, str) and candidate_category:
+            issues[0].category = candidate_category
 
         issue = validate_issue_locations(issues, self._changed_files)[0]
         # A summary downgrade is safe for the legacy pipeline but not for an explicit terminal finding.

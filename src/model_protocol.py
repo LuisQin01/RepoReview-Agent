@@ -8,12 +8,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import Mapping, TypeAlias
+from typing import Dict, List, Mapping, Union
+
+try:  # TypeAlias was added in Python 3.10.
+    from typing import TypeAlias
+except ImportError:  # pragma: no cover - exercised on Python < 3.10
+    TypeAlias = None  # type: ignore[assignment,misc]
 
 
-JSONValue: TypeAlias = (
-    None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
-)
+JSONValue: TypeAlias = Union[
+    None, bool, int, float, str, List["JSONValue"], Dict[str, "JSONValue"]
+]
 
 
 class ModelProtocolError(ValueError):

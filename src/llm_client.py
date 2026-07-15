@@ -21,13 +21,15 @@
        last_retry_info 属性上，供 trace / 日志读取，不污染返回值。
     4. provider 工厂：get_call_model 按 provider 创建 callable，便于切换 mock / openai。
 """
+from __future__ import annotations
+
 import json
 import os
 import time
 from functools import partial
 from typing import Mapping, Sequence
 
-from .model_protocol import JSONValue, ModelResponse, ModelProtocolError
+from .model_protocol import JSONValue, ModelProtocolError, ModelResponse, ToolCall
 
 
 # 默认单次请求超时（秒）：平衡响应速度与偶发慢请求容忍度
@@ -104,6 +106,181 @@ class ScriptedMockProvider:
         if isinstance(item, Mapping):
             return ModelResponse.from_dict(item)
         raise ModelProtocolError("mock_script_item_unsupported")
+
+
+class OpenAIModelProvider:
+    """Real OpenAI provider adapter for the ReAct controller.
+
+    Only this class touches the OpenAI SDK within the ReAct path.  It converts
+    internal tool schemas to the SDK ``tools`` format, sends the controller's
+    JSON-safe request history as SDK input, and parses SDK responses into
+    ``ModelResponse``.  It does not execute tools, validate or repair tool-call
+    arguments, or implement retry loops — the controller and the existing
+    ``call_with_retries`` own those concerns.
+
+    Each element of *tools* must expose ``name`` (str), ``description`` (str)
+    and ``parameters_schema`` (dict) attributes, matching the ``ReviewTool``
+    protocol and ``FinishReview``.
+    """
+
+    def __init__(
+        self,
+        tools: Sequence,
+        *,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self._sdk_tools = self._convert_tool_schemas(tools)
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def sdk_tools(self) -> tuple[dict[str, JSONValue], ...]:
+        """Return the converted SDK tool schemas (for inspection and tests)."""
+        return self._sdk_tools
+
+    @staticmethod
+    def _convert_tool_schemas(tools: Sequence) -> tuple[dict[str, JSONValue], ...]:
+        """Convert internal tool schemas to the OpenAI SDK ``tools`` format."""
+        converted: list[dict[str, JSONValue]] = []
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            description = getattr(tool, "description", None)
+            parameters = getattr(tool, "parameters_schema", None)
+            if not isinstance(name, str) or not name:
+                raise LLMConfigurationError("tool_name_must_be_a_non_empty_string")
+            if not isinstance(description, str):
+                raise LLMConfigurationError("tool_description_must_be_a_string")
+            if not isinstance(parameters, dict):
+                raise LLMConfigurationError("tool_parameters_schema_must_be_an_object")
+            converted.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            )
+        return tuple(converted)
+
+    def complete(self, request: Mapping[str, JSONValue]) -> ModelResponse:
+        """Call the OpenAI SDK and return a normalized ``ModelResponse``."""
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise LLMConfigurationError("missing_OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+        try:
+            # Lazy import: only the real ReAct path needs the SDK package.
+            from openai import OpenAI
+
+            # max_retries=0: the controller owns retry policy, not the SDK.
+            client = OpenAI(api_key=api_key, timeout=self._timeout_seconds, max_retries=0)
+            input_items = self._convert_request_to_input(request)
+            create_kwargs: dict[str, object] = {
+                "model": model,
+                "input": input_items,
+                "timeout": self._timeout_seconds,
+            }
+            if self._sdk_tools:
+                create_kwargs["tools"] = list(self._sdk_tools)
+            sdk_response = client.responses.create(**create_kwargs)
+            return self._parse_sdk_response(sdk_response)
+        except (LLMClientError, ModelProtocolError):
+            # Protocol errors (bad JSON in arguments) propagate unchanged so the
+            # controller can distinguish a malformed response from a provider fault.
+            raise
+        except Exception as exc:
+            error_type = LLMRetryableError if _is_retryable_provider_error(exc) else LLMClientError
+            raise error_type(f"openai_call_failed:{exc}") from exc
+
+    @staticmethod
+    def _convert_request_to_input(
+        request: Mapping[str, JSONValue],
+    ) -> list[dict[str, JSONValue]]:
+        """Convert the controller's JSON-safe history to OpenAI SDK input items."""
+        history = request.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        input_items: list[dict[str, JSONValue]] = []
+        for event in history:
+            if not isinstance(event, Mapping):
+                continue
+            role = event.get("role")
+            if role in ("user", "system", "developer"):
+                content = event.get("content")
+                if content is not None:
+                    input_items.append({"role": role, "content": content})
+            elif role == "assistant":
+                content = event.get("content")
+                if content is not None:
+                    input_items.append({"role": "assistant", "content": content})
+                for call in event.get("tool_calls", []):
+                    if not isinstance(call, Mapping):
+                        continue
+                    # SDK function_call arguments must be a JSON string.
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call.get("call_id", ""),
+                            "name": call.get("name", ""),
+                            "arguments": json.dumps(call.get("arguments", {}), ensure_ascii=False),
+                        }
+                    )
+            elif role == "tool":
+                # SDK function_call_output requires a string output field.
+                result = event.get("result", {})
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": event.get("call_id", ""),
+                        "output": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        return input_items
+
+    @staticmethod
+    def _parse_sdk_response(sdk_response: object) -> ModelResponse:
+        """Convert an OpenAI SDK response object to a ``ModelResponse``."""
+        text: str | None = None
+        tool_calls: list[ToolCall] = []
+        for item in getattr(sdk_response, "output", None) or []:
+            item_type = getattr(item, "type", None)
+            if item_type == "message":
+                for content in getattr(item, "content", None) or []:
+                    if getattr(content, "type", None) == "output_text":
+                        content_text = getattr(content, "text", None)
+                        if content_text:
+                            text = content_text if text is None else text + content_text
+            elif item_type == "function_call":
+                # ToolCall.from_raw_arguments parses the JSON string and rejects
+                # bad JSON with ModelProtocolError, never silently substituting {}.
+                tool_calls.append(
+                    ToolCall.from_raw_arguments(
+                        call_id=getattr(item, "call_id", None),
+                        name=getattr(item, "name", None),
+                        arguments=getattr(item, "arguments", ""),
+                    )
+                )
+        usage = OpenAIModelProvider._extract_usage(sdk_response)
+        finish_reason = getattr(sdk_response, "status", None)
+        return ModelResponse(
+            text=text,
+            tool_calls=tuple(tool_calls),
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+    @staticmethod
+    def _extract_usage(sdk_response: object) -> dict[str, JSONValue]:
+        """Map SDK usage counters to the internal usage dict, skipping non-integers."""
+        usage_obj = getattr(sdk_response, "usage", None)
+        if usage_obj is None:
+            return {}
+        usage: dict[str, JSONValue] = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            value = getattr(usage_obj, key, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                usage[key] = value
+        return usage
 
 
 # Mock 响应夹具：供测试与 CLI 冒烟使用，覆盖“正常”“空结果”“超时”“非法 JSON”等典型场景。

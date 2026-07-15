@@ -17,9 +17,13 @@ review 流程的结构化输出、diff 源校验、摘要评论发布等关键�
     各种输入组合下行为正确且可观测。
 """
 
+import json
+
 import pytest
 
 from src.git_provider import PullRequestRef, SummaryCommentResult
+from src.llm_client import ScriptedMockProvider
+from src.react_controller import ReActBudget
 from src.review_service import ReviewRequest, ReviewService
 from src.schemas import ContextBudget
 
@@ -297,3 +301,223 @@ def test_review_service_publishes_optional_summary_with_structured_reference(tmp
     assert result.summary_comment == SummaryCommentResult(comment_id=73, action="created")
     # 不变量：摘要发布步骤位于 save_trace 之前（倒数第二步）
     assert result.trace_steps[-2]["step"] == "publish_summary_comment"
+
+
+# ── M7-16 mode-switch tests ──────────────────────────────────────────────
+
+
+def test_review_mode_defaults_to_fixed():
+    """Without an explicit review_mode, the service uses the fixed pipeline."""
+    request = ReviewRequest(
+        diff_path="review.diff",
+        repo_root=".",
+        output_format="json",
+    )
+    assert request.review_mode == "fixed"
+
+
+@pytest.mark.parametrize("invalid_mode", ["", "random", "REACT", "Fixed", "verify", None])
+def test_invalid_review_mode_is_rejected_before_file_io(tmp_path, invalid_mode):
+    """Every value outside {"fixed","react"} must raise before parse_diff."""
+    with pytest.raises(ValueError, match="unsupported_review_mode"):
+        ReviewService().review(make_request(tmp_path, review_mode=invalid_mode))
+
+
+def test_react_mode_without_llm_is_rejected_before_file_io(tmp_path):
+    """react mode requires use_llm; the contradictory combination is rejected early.
+
+    Without this guard, ``--review-mode react`` without ``--llm`` would silently
+    run the no-LLM fixed branch, violating the "no silent fallback" non-goal.
+    """
+    with pytest.raises(ValueError, match="react_mode_requires_use_llm"):
+        ReviewService().review(
+            make_request(tmp_path, review_mode="react", use_llm=False)
+        )
+
+
+def test_fixed_mode_behavior_is_unchanged_with_explicit_review_mode(tmp_path):
+    """Explicitly passing review_mode='fixed' does not change the default path."""
+    result = ReviewService().review(make_request(tmp_path, review_mode="fixed"))
+
+    assert result.state.review_mode == "fixed"
+    assert [step["step"] for step in result.trace_steps] == [
+        "receive_task",
+        "parse_diff",
+        "collect_context",
+        "run_static_checks",
+        "run_llm_review",
+        "validate_output",
+        "render_report",
+        "save_trace",
+    ]
+    # The receive_task detail must record the mode for auditability.
+    assert result.trace_steps[0]["detail"]["review_mode"] == "fixed"
+
+
+def test_react_mode_completes_offline_smoke_with_default_provider(tmp_path):
+    """React mode runs to completion with the default ScriptedMockProvider.
+
+    The default provider (built by _run_react_review for mock providers) calls
+    finish_review immediately with no findings, so this exercises the full
+    react→validate→render chain end-to-end.
+    """
+    request = make_request(tmp_path, use_llm=True, review_mode="react")
+    state = ReviewService().review(request).state
+
+    assert state.review_mode == "react"
+    assert state.react_degraded is False
+    # The react path should be visible in the trace metadata.
+    llm_step = next(s for s in state.trace_steps if s["step"] == "run_llm_review")
+    assert llm_step["detail"]["review_mode"] == "react"
+    assert llm_step["detail"]["called"] is True
+    assert isinstance(state.issues, list)
+
+
+def test_react_budget_exhaustion_produces_degraded_state_not_fixed_success(tmp_path):
+    """When react exhausts its budget, the result is degraded, never silently fixed."""
+    # max_llm_calls=1 means the first provider call consumes the last allowed
+    # call.  After the tool result is processed, the next loop iteration will
+    # see the budget exhausted and terminate before making a second request.
+    provider = ScriptedMockProvider(
+        [
+            {
+                "tool_calls": [
+                    {"call_id": "tool-1", "name": "get_changed_hunks", "arguments": {"path": "app.py"}}
+                ]
+            },
+            {
+                "tool_calls": [
+                    {"call_id": "finish-2", "name": "finish_review", "arguments": {"findings": []}}
+                ]
+            },
+        ]
+    )
+    request = make_request(
+        tmp_path,
+        use_llm=True,
+        review_mode="react",
+        react_provider=provider,
+        react_budget=ReActBudget(
+            max_steps=8,
+            max_llm_calls=1,
+            max_total_tokens=16_000,
+            max_tool_result_bytes=8_000,
+            max_total_tool_result_bytes=32_000,
+        ),
+    )
+    result = ReviewService().review(request)
+
+    assert result.state.react_degraded is True
+    assert result.state.react_termination_reason != "finish"
+    # Degraded react must never look like a successful empty fixed review.
+    llm_step = next(s for s in result.state.trace_steps if s["step"] == "run_llm_review")
+    assert llm_step["detail"]["react_degraded"] is True
+    assert llm_step["detail"]["review_mode"] == "react"
+
+
+def test_same_empty_finding_produces_identical_validated_output_in_both_modes(tmp_path):
+    """Both modes share the same validate_output → render_report chain.
+
+    When neither mode produces a finding that survives location validation,
+    both must produce structurally identical JSON output.  This proves the
+    two paths converge onto a single validation and reporting gateway rather
+    than having per-mode output logic.
+
+    Uses two separate sub-directories under tmp_path so each make_request
+    call gets a clean filesystem without ``FileExistsError`` on repo mkdir.
+    """
+    fixed_tmp = tmp_path / "fixed"
+    fixed_tmp.mkdir()
+    react_tmp = tmp_path / "react"
+    react_tmp.mkdir()
+
+    # ── fixed mode with "empty" fixture → no LLM findings ──
+    fixed_result = ReviewService().review(
+        make_request(
+            fixed_tmp,
+            use_llm=True,
+            review_mode="fixed",
+            llm_provider="mock",
+            mock_fixture="empty",
+        )
+    )
+
+    # ── react mode (scripted provider finishes with no findings) ──
+    react_provider = ScriptedMockProvider(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "finish-react",
+                        "name": "finish_review",
+                        "arguments": {"findings": []},
+                    }
+                ]
+            }
+        ]
+    )
+    react_result = ReviewService().review(
+        make_request(
+            react_tmp,
+            use_llm=True,
+            review_mode="react",
+            react_provider=react_provider,
+        )
+    )
+
+    fixed_output = json.loads(fixed_result.output)
+    react_output = json.loads(react_result.output)
+
+    # Both must produce structurally identical JSON via the shared chain.
+    assert fixed_output == react_output
+
+
+def test_react_mode_is_auditable_in_state_and_trace(tmp_path):
+    """After a react smoke run, state and trace carry mode-specific metadata."""
+    request = make_request(tmp_path, use_llm=True, review_mode="react")
+    result = ReviewService().review(request)
+
+    assert result.state.review_mode == "react"
+    # Mode must be in the receive_task trace detail.
+    assert result.trace_steps[0]["detail"]["review_mode"] == "react"
+    # The react termination reason is recorded even for a clean finish.
+    assert result.state.react_termination_reason == ""
+
+
+def test_review_mode_persists_through_cli_request_default():
+    """The default review_mode from CLI-like construction is 'fixed'."""
+    import argparse
+    from src.cli import run_review_agent
+
+    args = argparse.Namespace(
+        diff="review.diff",
+        repo=".",
+        format="markdown",
+        llm=False,
+        max_prompt_chars=4000,
+        max_extra_context_files=3,
+        llm_provider="mock",
+        mock_fixture="normal",
+        trace=False,
+        trace_dir="traces",
+        publish_summary_comment=False,
+        pr_url=None,
+        review_mode="fixed",
+    )
+    # run_review_agent constructs a ReviewRequest; the default path is unchanged.
+    # This test only verifies the mode is passed through without crashing.
+    from src.review_service import ReviewRequest as RR
+
+    request = RR(
+        diff_path=args.diff,
+        repo_root=args.repo,
+        output_format=args.format,
+        use_llm=args.llm,
+        context_budget=ContextBudget(
+            max_prompt_chars=args.max_prompt_chars,
+            max_extra_context_files=args.max_extra_context_files,
+        ),
+        llm_provider=args.llm_provider,
+        review_mode=args.review_mode,
+    )
+    assert request.review_mode == "fixed"

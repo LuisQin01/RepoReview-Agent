@@ -27,12 +27,20 @@ from .agent_state import ReviewState
 from .diff_parser import parse_diff
 from .file_context import collect_file_contexts
 from .git_provider import GitProvider, PullRequestRef, SummaryCommentResult
-from .llm_client import LLMClientError, get_call_model
+from .llm_client import LLMClientError, ScriptedMockProvider, get_call_model
 from .llm_reviewer import review_with_llm
+from .react_controller import ReActBudget, ReActController
 from .reporter import (
     render_json_report,
     render_markdown_report,
     render_summary_comment,
+)
+from .review_tools import (
+    ChangedHunksTool,
+    FinishReview,
+    ReadFileContextTool,
+    SearchPythonSymbolTool,
+    ToolDispatcher,
 )
 from .reviewers import review_changed_files
 from .schemas import ContextBudget
@@ -42,6 +50,9 @@ from .trace import (
     save_trace,
 )
 from .validation import validate_issue_locations
+
+# Valid review_mode values.  Every other input must be rejected before state creation.
+_VALID_REVIEW_MODES = frozenset({"fixed", "react"})
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,19 @@ class ReviewRequest:
     trace_dir: str = "traces"
     publish_summary_comment: bool = False
     pull_request: Optional[PullRequestRef] = None
+    # Which review pipeline to run.  "fixed" (default) uses the existing single-call
+    # LLM review; "react" delegates to the tool-calling ReAct controller.  Values
+    # outside {"fixed","react"} are rejected before any file I/O or provider call.
+    review_mode: str = "fixed"
+    # Budget configuration for the ReAct controller.  Only used when review_mode=="react";
+    # when None, the controller's own defaults apply.
+    react_budget: Optional[ReActBudget] = None
+    # Provider for the ReAct controller.  Only used when review_mode=="react".
+    # Tests inject a ScriptedMockProvider here; production code leaves it None
+    # so _run_react_review resolves the provider from llm_provider.
+    react_provider: object = field(default=None, repr=False, compare=False)
+
+
 
 
 @dataclass
@@ -194,6 +218,88 @@ def validate_issues(issues, changed_files):
     return validate_issue_locations(issues, changed_files)
 
 
+def _run_react_review(
+    state: ReviewState,
+    request: ReviewRequest,
+    *,
+    react_provider: object | None = None,
+) -> list:
+    """Run one ReAct tool-calling review and return validated findings.
+
+    React failures produce ``react_degraded=True`` on ``state`` and return an
+    empty list; they **never** fall back to the fixed pipeline.  A dedicated
+    provider injection parameter supports offline deterministic testing.
+    """
+    # Build the tool dispatcher so the model can query changed hunks, file
+    # context, and Python symbols within the review scope defined by the diff.
+    review_scope = [changed_file.path for changed_file in state.changed_files]
+    dispatcher = ToolDispatcher()
+    dispatcher.register(ChangedHunksTool(state.changed_files, review_scope))
+    dispatcher.register(ReadFileContextTool(state.repo_root))
+    dispatcher.register(SearchPythonSymbolTool(state.repo_root, review_scope))
+
+    finish_review = FinishReview(state.changed_files)
+
+    # Resolve the provider.  Test callers inject a scripted provider;
+    # production currently only supports the "mock" provider for react mode.
+    if react_provider is not None:
+        provider = react_provider
+    elif state.llm_provider == "mock":
+        # Default script: immediately finish with no findings so a caller can
+        # compose its own smoke script without rebuilding the dispatcher.
+        provider = ScriptedMockProvider(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "finish-default",
+                            "name": "finish_review",
+                            "arguments": {"findings": []},
+                        }
+                    ]
+                }
+            ]
+        )
+    else:
+        # M7-10 function-calling adapter is required before a real provider can
+        # drive the ReAct loop.  Block this early with a clear reason.
+        raise ValueError(
+            f"react_mode_requires_mock_provider_for_now:{state.llm_provider}"
+        )
+
+    budget = request.react_budget or ReActBudget()
+    controller = ReActController(
+        provider=provider,
+        dispatcher=dispatcher,
+        finish_review=finish_review,
+        budget=budget,
+        state=state,
+    )
+
+    # Build the initial request.  The mock provider drives the loop via its
+    # script rather than consuming the prompt; the prompt is included so that a
+    # future real-provider adapter can use it.
+    initial_request = {
+        "review_id": state.task_id,
+        "system": (
+            "You are a code review agent. Review the changed files using the "
+            "available tools. Call finish_review when done."
+        ),
+        "changed_files": [changed_file.path for changed_file in state.changed_files],
+        "history": [],
+    }
+
+    result = controller.run(initial_request)
+
+    if not result.finished:
+        # React did not finish; state.react_degraded was already set by the
+        # controller's _terminate call.  Return no findings so this degradation
+        # is never mistaken for a successful empty review.
+        return []
+
+    return list(result.findings)
+
+
 class ReviewService:
     """执行一次确定性的审查工作流，不耦合 CLI 专属输入。
 
@@ -259,6 +365,14 @@ class ReviewService:
         # 发布评论必须提供 git provider 工厂
         if request.publish_summary_comment and self._git_provider_factory is None:
             raise ValueError("git_provider_required_for_summary_comment")
+        # review_mode must be one of the known values; reject everything else before any I/O.
+        if request.review_mode not in _VALID_REVIEW_MODES:
+            raise ValueError("unsupported_review_mode")
+        # react mode drives a multi-turn LLM tool-calling loop; without use_llm it
+        # would silently fall through to the no-LLM fixed branch, violating the
+        # "no silent fallback" non-goal.  Reject the contradictory combination early.
+        if request.review_mode == "react" and not request.use_llm:
+            raise ValueError("react_mode_requires_use_llm")
 
         # --- 初始化运行状态 ---
         state = ReviewState(
@@ -270,6 +384,7 @@ class ReviewService:
             llm_provider=request.llm_provider,
             trace_enabled=request.trace_enabled,
             trace_dir=request.trace_dir,
+            review_mode=request.review_mode,
         )
 
         # 步骤1：receive_task —— 记录任务接收，计时从 state 初始化时刻开始
@@ -282,6 +397,7 @@ class ReviewService:
                 "format": state.output_format,
                 "llm": state.use_llm,
                 "llm_provider": state.llm_provider,
+                "review_mode": state.review_mode,
             },
             started_at_perf=state.started_at_perf,
         )
@@ -342,7 +458,46 @@ class ReviewService:
         )
 
         # 步骤5：run_llm_review —— 可选的 LLM 审查步骤
-        if state.use_llm:
+        # Branch on review_mode so the react path is explicit and never a silent fallback.
+        if state.use_llm and state.review_mode == "react":
+            step_started_at_perf = perf_counter()
+            try:
+                react_issues = _run_react_review(state, request, react_provider=request.react_provider)
+                state.issues.extend(react_issues)
+                record_step(
+                    state,
+                    "run_llm_review",
+                    {
+                        "called": True,
+                        "provider": state.llm_provider,
+                        "review_mode": "react",
+                        "findings": len(react_issues),
+                        "react_degraded": state.react_degraded,
+                        "react_termination_reason": (
+                            state.react_termination_reason if state.react_degraded else "finish"
+                        ),
+                    },
+                    started_at_perf=step_started_at_perf,
+                )
+            except Exception as exc:
+                # React failure is explicit degradation, never a silent fixed-success substitution.
+                state.errors.append(sanitize_trace_text(exc))
+                state.react_degraded = True
+                state.react_termination_reason = getattr(exc, "code", "react_review_failed")
+                record_step(
+                    state,
+                    "run_llm_review",
+                    {
+                        "called": True,
+                        "provider": state.llm_provider,
+                        "review_mode": "react",
+                        "findings": 0,
+                        "react_degraded": True,
+                        "error": sanitize_trace_text(exc),
+                    },
+                    started_at_perf=step_started_at_perf,
+                )
+        elif state.use_llm:
             step_started_at_perf = perf_counter()
             call_model = None
             try:

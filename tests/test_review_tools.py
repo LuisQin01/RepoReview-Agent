@@ -336,6 +336,30 @@ def test_finish_review_terminates_with_only_existing_validator_output():
     assert result.findings[0].placement == "inline"
 
 
+def test_finish_review_preserves_explicit_candidate_category():
+    """A terminal finding may carry a specific review category (e.g.
+    exception_handling); it must not be forced to "llm" by parse_llm_response."""
+    finding = {**_valid_finish_finding(), "category": "exception_handling"}
+    finish = FinishReview(_finish_changed_files())
+
+    result = finish.finish({"findings": [finding]})
+
+    assert result.finished is True
+    assert result.finding_count == 1
+    assert result.findings[0].category == "exception_handling"
+
+
+def test_finish_review_defaults_category_to_llm_when_absent():
+    """A terminal finding without an explicit category keeps the established
+    "llm" default so existing behavior is preserved."""
+    finish = FinishReview(_finish_changed_files())
+
+    result = finish.finish({"findings": [_valid_finish_finding()]})
+
+    assert result.finished is True
+    assert result.findings[0].category == "llm"
+
+
 def test_finish_review_safely_terminates_with_an_empty_result():
     finish = FinishReview(_finish_changed_files())
 

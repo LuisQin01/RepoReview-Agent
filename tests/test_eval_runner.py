@@ -713,6 +713,8 @@ def test_main_rejects_llm_enabled_fixed_baseline(tmp_path, monkeypatch):
         baseline_output=str(output_path),
         commit="abc123",
         worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
     )
 
     calls = []
@@ -744,6 +746,8 @@ def test_main_writes_a_readable_fixed_baseline_with_reproduction_command(
         baseline_output=str(output_path),
         commit="abc123",
         worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
     )
     metrics = {
         "cases": 1,
@@ -757,6 +761,12 @@ def test_main_writes_a_readable_fixed_baseline_with_reproduction_command(
         "false_negative_count": 0,
         "average_findings": 1.0,
         "average_duration_ms": 12.0,
+        "p95_duration_ms": 12.0,
+        "total_tokens": 0,
+        "total_llm_calls": 0,
+        "estimated_cost_usd": 0.0,
+        "unknown_tool_count": 0,
+        "budget_exhausted_count": 0,
         "results": [],
     }
 
@@ -813,6 +823,8 @@ def test_main_rejects_untracked_files_before_starting_fixed_baseline_eval(
         baseline_output=str(output_path),
         commit="unknown",
         worktree_state="unknown",
+        compare_modes=False,
+        comparison_output=None,
     )
     git_outputs = iter((b"abc123\n", b"?? evals/cases/new-case/expected.json\n"))
     calls = []
@@ -863,6 +875,8 @@ def test_main_can_record_the_same_untracked_baseline_output_twice_in_a_git_repo(
         baseline_output="evals/baselines/fixed.json",
         commit=commit,
         worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
     )
     metrics = {
         "cases": 0,
@@ -871,11 +885,17 @@ def test_main_can_record_the_same_untracked_baseline_output_twice_in_a_git_repo(
         "json_valid_rate": 0.0,
         "average_findings": 0.0,
         "average_duration_ms": 0.0,
+        "p95_duration_ms": 0.0,
         "precision": 0.0,
         "recall": 0.0,
         "f1": 0.0,
         "false_positive_rate": 0.0,
         "false_negative_count": 0,
+        "total_tokens": 0,
+        "total_llm_calls": 0,
+        "estimated_cost_usd": 0.0,
+        "unknown_tool_count": 0,
+        "budget_exhausted_count": 0,
         "results": [],
     }
 
@@ -913,6 +933,8 @@ def test_main_rejects_spoofed_baseline_commit_before_eval(tmp_path, monkeypatch)
         baseline_output=str(tmp_path / "baseline.json"),
         commit="spoofed",
         worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
     )
     calls = []
 
@@ -1093,3 +1115,565 @@ def test_capture_source_revision_still_rejects_untracked_source_outside_output_d
         )
 
 
+def test_main_compare_modes_regenerates_output_with_existing_untracked_sibling(
+    tmp_path, monkeypatch
+):
+    """--compare-modes must succeed when a sibling output is already untracked.
+
+    Reproduces the P0-1 scenario: ``evals/comparisons/m7-18.json`` is recorded
+    against a stale commit, and a previously generated sibling output sits
+    untracked in the same directory.  Regenerating the same path must not
+    raise ``unsupported`` and must overwrite the recorded file.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "src").mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.email", "tests@example.invalid")
+    git("config", "user.name", "Eval Test")
+    (repo_root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "initial")
+
+    output_dir = repo_root / "evals" / "comparisons"
+    output_dir.mkdir(parents=True)
+    # A previously generated sibling output, untracked, would block regenerating
+    # any new sibling under the same directory before the P0-1 fix.
+    (output_dir / "m7-18-prev.json").write_text(
+        json.dumps({"stale": True}), encoding="utf-8"
+    )
+    output_path = output_dir / "m7-18.json"
+
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output=None,
+        commit="unknown",
+        worktree_state="unknown",
+        compare_modes=True,
+        comparison_output="evals/comparisons/m7-18.json",
+    )
+    comparison = {
+        "fixed": {
+            "precision": 0.5, "recall": 1.0, "f1": 0.667,
+            "p95_duration_ms": 10, "total_tokens": 0, "total_llm_calls": 0,
+            "estimated_cost_usd": 0.0, "unknown_tool_count": 0,
+            "budget_exhausted_count": 0, "results": [],
+        },
+        "react": {
+            "precision": 0.5, "recall": 1.0, "f1": 0.667,
+            "p95_duration_ms": 20, "total_tokens": 1000, "total_llm_calls": 3,
+            "estimated_cost_usd": 0.0005, "unknown_tool_count": 0,
+            "budget_exhausted_count": 0, "results": [],
+        },
+        "comparison": {
+            "per_case_diff": [],
+            "aggregate_diff": {
+                "precision_delta": 0.0, "recall_delta": 0.0, "f1_delta": 0.0,
+                "p95_latency_delta_ms": 10, "token_delta": 1000,
+                "llm_call_delta": 3, "cost_delta_usd": 0.0005,
+            },
+        },
+    }
+
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(
+        eval_runner, "__file__", str(repo_root / "src" / "eval_runner.py")
+    )
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        eval_runner, "run_mode_comparison", lambda **kwargs: comparison
+    )
+
+    eval_runner.main()
+
+    assert output_path.exists()
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == "m7_comparison.v1"
+    # The pre-existing sibling must remain untouched.
+    assert json.loads((output_dir / "m7-18-prev.json").read_text()) == {"stale": True}
+
+
+# ---------------------------------------------------------------------------
+# M7-18: Fixed vs ReAct comparison eval tests
+# ---------------------------------------------------------------------------
+
+
+def test_percentile_nearest_rank_basic():
+    """Nearest-rank percentile returns the expected value for known input."""
+    values = [10, 20, 30, 40, 50, 60]
+    assert eval_runner._percentile(values, 95) == 60.0
+    assert eval_runner._percentile(values, 50) == 30.0
+    assert eval_runner._percentile(values, 100) == 60.0
+
+
+def test_percentile_empty_returns_zero():
+    """An empty duration list must not raise."""
+    assert eval_runner._percentile([], 95) == 0.0
+
+
+def test_estimate_cost_zero_for_zero_tokens():
+    """No tokens means no estimated cost."""
+    assert eval_runner._estimate_cost(0) == 0.0
+
+
+def test_estimate_cost_positive_for_positive_tokens():
+    """A positive token count yields a positive, finite cost."""
+    cost = eval_runner._estimate_cost(1_000_000)
+    assert cost > 0
+    # 60% input at $0.15/1M + 40% output at $0.60/1M = 0.09 + 0.24 = 0.33
+    assert abs(cost - 0.33) < 0.001
+
+
+def test_extract_react_observability_reads_state_counters():
+    """React counters on state are surfaced; missing fields default safely."""
+    state = SimpleNamespace(
+        react_steps=3,
+        react_llm_calls=3,
+        react_total_tokens=1200,
+        react_degraded=False,
+        react_termination_reason="finish",
+        react_tool_results_truncated=0,
+        trace_steps=[
+            {
+                "step": "react_tool_result",
+                "detail": {"tool_name": "get_changed_hunks", "result": {"error_code": None}},
+            },
+            {
+                "step": "react_tool_result",
+                "detail": {"tool_name": "nonexistent_tool", "result": {"error_code": "not_found"}},
+            },
+        ],
+    )
+    obs = eval_runner._extract_react_observability(state)
+    assert obs["react_steps"] == 3
+    assert obs["react_llm_calls"] == 3
+    assert obs["react_total_tokens"] == 1200
+    assert obs["react_degraded"] is False
+    assert obs["react_termination_reason"] == "finish"
+    assert obs["unknown_tool_count"] == 1
+    assert obs["budget_exhausted"] is False
+
+
+def test_extract_react_observability_marks_budget_exhausted():
+    """Termination reasons in the exhaustion set are flagged."""
+    state = SimpleNamespace(
+        react_steps=8,
+        react_llm_calls=8,
+        react_total_tokens=16000,
+        react_degraded=True,
+        react_termination_reason="max_steps_exhausted",
+        react_tool_results_truncated=0,
+        trace_steps=[],
+    )
+    obs = eval_runner._extract_react_observability(state)
+    assert obs["budget_exhausted"] is True
+    assert obs["react_degraded"] is True
+
+
+def test_run_one_case_passes_review_mode_to_request(tmp_path, monkeypatch):
+    """run_one_case must forward review_mode to ReviewRequest."""
+    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
+    captured = []
+
+    class CapturingReviewService:
+        def review(self, request):
+            captured.append(request)
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    issues=[],
+                    react_steps=0,
+                    react_llm_calls=0,
+                    react_total_tokens=0,
+                    react_degraded=False,
+                    react_termination_reason="",
+                    react_tool_results_truncated=0,
+                    trace_steps=[],
+                )
+            )
+
+    monkeypatch.setattr(eval_runner, "ReviewService", CapturingReviewService)
+
+    eval_runner.run_one_case(case_dir, tmp_path, review_mode="react", use_llm=True)
+
+    assert captured[0].review_mode == "react"
+
+
+def test_run_one_case_includes_react_observability_in_result(tmp_path, monkeypatch):
+    """React counters must appear in the per-case result dict."""
+    case_dir = make_case(tmp_path, expected_categories=[], should_find=False)
+
+    class ReactStateReviewService:
+        def review(self, request):
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    issues=[],
+                    react_steps=2,
+                    react_llm_calls=2,
+                    react_total_tokens=500,
+                    react_degraded=False,
+                    react_termination_reason="finish",
+                    react_tool_results_truncated=0,
+                    trace_steps=[],
+                )
+            )
+
+    monkeypatch.setattr(eval_runner, "ReviewService", ReactStateReviewService)
+
+    result = eval_runner.run_one_case(case_dir, tmp_path, review_mode="react", use_llm=True)
+
+    assert result["react_steps"] == 2
+    assert result["react_llm_calls"] == 2
+    assert result["react_total_tokens"] == 500
+    assert result["budget_exhausted"] is False
+    assert result["unknown_tool_count"] == 0
+    assert result["review_mode"] == "react"
+
+
+def test_build_react_provider_cross_file_case_calls_read_and_finish(tmp_path):
+    """Cases with discovered documentation must read evidence and finish.
+
+    The factory discovers docs by scanning the filesystem, not by reading the
+    case manifest.  The finding location is derived from the diff's added lines.
+    """
+    # Create a documentation file in the repo root (discovered by filesystem scan).
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "payment-contract.md").write_text("# Contract\n", encoding="utf-8")
+
+    changed_files = parse_diff(
+        "diff --git a/api/checkout.py b/api/checkout.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " def f():\n"
+        "+    pass\n"
+    )
+
+    provider = eval_runner._build_react_provider(tmp_path, tmp_path, changed_files)
+
+    # Three scripted responses: get_changed_hunks, read_file_context, finish_review.
+    placeholder_history = [{"role": "tool", "call_id": "call-hunks", "result": {}}]
+
+    resp1 = provider.complete({"history": []})
+    assert resp1.tool_calls[0].name == "get_changed_hunks"
+
+    resp2 = provider.complete({"history": placeholder_history})
+    assert resp2.tool_calls[0].name == "read_file_context"
+    assert resp2.tool_calls[0].arguments["path"] == "docs/payment-contract.md"
+
+    resp3 = provider.complete({"history": placeholder_history})
+    assert resp3.tool_calls[0].name == "finish_review"
+    findings = resp3.tool_calls[0].arguments["findings"]
+    assert len(findings) == 1
+    # File and line are derived from the diff's first added line.
+    assert findings[0]["file"] == "api/checkout.py"
+    assert findings[0]["line"] == 2
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["category"] == "exception_handling"
+    assert findings[0]["evidence"] == "docs/payment-contract.md"
+
+
+def test_build_react_provider_does_not_inject_ground_truth(tmp_path):
+    """The factory must not contain content from expected_findings or repository_context.
+
+    The factory signature no longer receives ``expected`` at all, structurally
+    preventing ground-truth injection.  This test guards against a regression
+    that re-introduces ``expected`` reading.
+    """
+    # Create a documentation file that the factory will discover via filesystem.
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "contract.md").write_text("# Contract\n", encoding="utf-8")
+
+    changed_files = parse_diff(
+        "diff --git a/app.py b/app.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " def f():\n"
+        "+    pass\n"
+    )
+
+    # The factory receives (case_dir, repo_root, changed_files) — no expected.
+    provider = eval_runner._build_react_provider(tmp_path, tmp_path, changed_files)
+
+    # Drain all three scripted responses.
+    placeholder_history = [{"role": "tool", "call_id": "call-hunks", "result": {}}]
+    provider.complete({"history": []})
+    provider.complete({"history": placeholder_history})
+    resp3 = provider.complete({"history": placeholder_history})
+
+    assert resp3.tool_calls[0].name == "finish_review"
+    findings = resp3.tool_calls[0].arguments["findings"]
+    assert len(findings) == 1
+
+    # The finding's file and line must come from the diff, not from any manifest.
+    assert findings[0]["file"] == "app.py"
+    assert findings[0]["line"] == 2
+
+    # The evidence path is discovered via filesystem scan, not from required_paths.
+    assert findings[0]["evidence"] == "docs/contract.md"
+
+
+def test_build_react_provider_ignores_repository_context_metadata(tmp_path):
+    """The factory must discover docs via filesystem, not via repository_context.
+
+    This is the P0-1 regression guard: even if a case manifest declares
+    ``repository_context.required_paths`` pointing to a non-existent file,
+    the factory must discover the actual documentation by scanning the
+    filesystem, not by reading the manifest.
+    """
+    # Create a fixture root with a real doc file.
+    fixture_root = tmp_path / "repository_context"
+    docs_dir = fixture_root / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "payment-contract.md").write_text("# Contract\n", encoding="utf-8")
+
+    # The factory receives the fixture root as repo_root; it does NOT receive
+    # expected, so repository_context metadata is structurally inaccessible.
+    changed_files = parse_diff(
+        "diff --git a/api/checkout.py b/api/checkout.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " def f():\n"
+        "+    pass\n"
+    )
+
+    provider = eval_runner._build_react_provider(tmp_path, fixture_root, changed_files)
+
+    placeholder_history = [{"role": "tool", "call_id": "call-hunks", "result": {}}]
+    resp1 = provider.complete({"history": []})
+    assert resp1.tool_calls[0].name == "get_changed_hunks"
+
+    resp2 = provider.complete({"history": placeholder_history})
+    assert resp2.tool_calls[0].name == "read_file_context"
+    # The path is discovered via filesystem scan of fixture_root, not from
+    # repository_context.required_paths (which the factory never sees).
+    assert resp2.tool_calls[0].arguments["path"] == "docs/payment-contract.md"
+
+
+def test_build_react_provider_non_cross_file_case_finishes_empty(tmp_path):
+    """Cases without documentation files must finish with no findings."""
+    # tmp_path has no *.md files — the factory should finish empty.
+    changed_files = parse_diff(
+        "diff --git a/app.py b/app.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " def f():\n"
+        "+    pass\n"
+    )
+
+    provider = eval_runner._build_react_provider(tmp_path, tmp_path, changed_files)
+
+    placeholder_history = [{"role": "tool", "call_id": "call-hunks", "result": {}}]
+
+    resp1 = provider.complete({"history": []})
+    assert resp1.tool_calls[0].name == "get_changed_hunks"
+
+    resp2 = provider.complete({"history": placeholder_history})
+    assert resp2.tool_calls[0].name == "finish_review"
+    assert resp2.tool_calls[0].arguments["findings"] == []
+
+
+def test_build_per_case_diff_identifies_new_fp_and_fixed_fn():
+    """Per-case diff must separate new false positives from fixed false negatives."""
+    fixed_results = [
+        {"case_id": "a", "passed": False, "expected_categories": ["x"],
+         "actual_categories": []},
+        {"case_id": "b", "passed": True, "expected_categories": ["y"],
+         "actual_categories": ["y"]},
+    ]
+    react_results = [
+        {"case_id": "a", "passed": False, "expected_categories": ["x"],
+         "actual_categories": ["x", "llm"]},
+        {"case_id": "b", "passed": True, "expected_categories": ["y"],
+         "actual_categories": ["y"]},
+    ]
+
+    diffs = eval_runner._build_per_case_diff(fixed_results, react_results)
+
+    assert diffs[0]["case_id"] == "a"
+    assert diffs[0]["new_false_positives"] == ["llm"]
+    assert diffs[0]["fixed_false_negatives"] == ["x"]
+    assert diffs[1]["case_id"] == "b"
+    assert diffs[1]["new_false_positives"] == []
+    assert diffs[1]["fixed_false_negatives"] == []
+
+
+def test_run_mode_comparison_returns_both_modes_and_diff(tmp_path, monkeypatch):
+    """run_mode_comparison must run fixed and react and compute a diff."""
+    cases_dir = tmp_path / "cases"
+    (cases_dir / "c1").mkdir(parents=True)
+
+    call_log = []
+
+    def fake_run_eval(cases_dir, repo_root, **kwargs):
+        mode = kwargs.get("review_mode", "fixed")
+        call_log.append(mode)
+        if mode == "fixed":
+            return {
+                "precision": 0.8, "recall": 0.6, "f1": 0.7,
+                "p95_duration_ms": 50, "total_tokens": 0, "total_llm_calls": 0,
+                "estimated_cost_usd": 0.0, "unknown_tool_count": 0,
+                "budget_exhausted_count": 0,
+                "results": [
+                    {"case_id": "c1", "passed": False, "expected_categories": ["x"],
+                     "actual_categories": []},
+                ],
+            }
+        return {
+            "precision": 0.7, "recall": 0.6, "f1": 0.65,
+            "p95_duration_ms": 100, "total_tokens": 2000, "total_llm_calls": 6,
+            "estimated_cost_usd": 0.001, "unknown_tool_count": 0,
+            "budget_exhausted_count": 0,
+            "results": [
+                {"case_id": "c1", "passed": False, "expected_categories": ["x"],
+                 "actual_categories": ["x", "llm"]},
+            ],
+        }
+
+    monkeypatch.setattr(eval_runner, "run_eval", fake_run_eval)
+
+    comparison = eval_runner.run_mode_comparison(cases_dir, tmp_path)
+
+    assert "fixed" in comparison
+    assert "react" in comparison
+    assert "comparison" in comparison
+    assert call_log == ["fixed", "react"]
+
+    agg = comparison["comparison"]["aggregate_diff"]
+    assert agg["precision_delta"] == pytest.approx(-0.1)
+    assert agg["recall_delta"] == pytest.approx(0.0)
+    assert agg["token_delta"] == 2000
+
+    per_case = comparison["comparison"]["per_case_diff"]
+    assert per_case[0]["new_false_positives"] == ["llm"]
+    assert per_case[0]["fixed_false_negatives"] == ["x"]
+
+
+def test_build_comparison_record_preserves_configuration_and_metrics():
+    """The comparison record must be JSON-serializable and contain all blocks."""
+    comparison = {
+        "fixed": {"precision": 1.0, "results": []},
+        "react": {"precision": 0.5, "results": []},
+        "comparison": {
+            "per_case_diff": [],
+            "aggregate_diff": {"precision_delta": -0.5},
+        },
+    }
+
+    record = eval_runner.build_comparison_record(
+        comparison,
+        cases_dir="evals/cases",
+        repo_root=".",
+        llm_provider="mock",
+        commit="abc123",
+        worktree_state="clean",
+        worktree_diff_sha256=None,
+        comparison_output="evals/comparisons/m7-18.json",
+    )
+
+    assert record["schema_version"] == "m7_comparison.v1"
+    assert record["commit"] == "abc123"
+    assert record["configuration"]["react_budget"]["max_steps"] > 0
+    assert record["fixed"]["precision"] == 1.0
+    assert record["react"]["precision"] == 0.5
+    assert record["comparison"]["aggregate_diff"]["precision_delta"] == -0.5
+    # Must be JSON-serializable.
+    json.dumps(record)
+
+
+def test_main_compare_modes_writes_output_and_prints_summary(tmp_path, monkeypatch):
+    """CLI --compare-modes must persist a readable record and print metrics."""
+    output_path = tmp_path / "comparison.json"
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=False,
+        llm_provider="mock",
+        baseline_output=None,
+        commit="unknown",
+        worktree_state="unknown",
+        compare_modes=True,
+        comparison_output=str(output_path),
+    )
+    comparison = {
+        "fixed": {
+            "precision": 0.8, "recall": 0.6, "f1": 0.7,
+            "p95_duration_ms": 50, "total_tokens": 0, "total_llm_calls": 0,
+            "estimated_cost_usd": 0.0, "unknown_tool_count": 0,
+            "budget_exhausted_count": 0, "results": [],
+        },
+        "react": {
+            "precision": 0.7, "recall": 0.6, "f1": 0.65,
+            "p95_duration_ms": 100, "total_tokens": 2000, "total_llm_calls": 6,
+            "estimated_cost_usd": 0.001, "unknown_tool_count": 0,
+            "budget_exhausted_count": 0, "results": [],
+        },
+        "comparison": {
+            "per_case_diff": [],
+            "aggregate_diff": {
+                "precision_delta": -0.1, "recall_delta": 0.0, "f1_delta": -0.05,
+                "p95_latency_delta_ms": 50, "token_delta": 2000,
+                "llm_call_delta": 6, "cost_delta_usd": 0.001,
+            },
+        },
+    }
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "run_mode_comparison", lambda **kwargs: comparison)
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision("abc", "clean", None),
+    )
+
+    eval_runner.main()
+
+    assert output_path.exists()
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == "m7_comparison.v1"
+    assert record["fixed"]["precision"] == 0.8
+    assert record["react"]["precision"] == 0.7
+
+
+def test_run_eval_includes_observability_metrics(tmp_path, monkeypatch):
+    """run_eval must include p95, tokens, cost, and budget metrics in the output."""
+    cases_dir = tmp_path / "cases"
+    (cases_dir / "c1").mkdir(parents=True)
+
+    def fake_run_one_case(case_dir, **kwargs):
+        return {
+            "case_id": case_dir.name,
+            "passed": True,
+            "json_valid": True,
+            "false_positive": False,
+            "is_negative_case": False,
+            "findings_count": 1,
+            "tp": 1, "fp": 0, "fn": 0,
+            "duration_ms": 42,
+            "error": "",
+            "review_mode": kwargs.get("review_mode", "fixed"),
+            "react_steps": 1, "react_llm_calls": 1, "react_total_tokens": 100,
+            "react_degraded": False, "react_termination_reason": "finish",
+            "react_tool_results_truncated": 0,
+            "unknown_tool_count": 0, "budget_exhausted": False,
+        }
+
+    monkeypatch.setattr(eval_runner, "run_one_case", fake_run_one_case)
+
+    metrics = eval_runner.run_eval(cases_dir, tmp_path, review_mode="react")
+
+    assert "p95_duration_ms" in metrics
+    assert metrics["p95_duration_ms"] == 42.0
+    assert metrics["total_tokens"] == 100
+    assert metrics["total_llm_calls"] == 1
+    assert metrics["estimated_cost_usd"] > 0
+    assert metrics["unknown_tool_count"] == 0
+    assert metrics["budget_exhausted_count"] == 0

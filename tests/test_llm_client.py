@@ -35,10 +35,11 @@ from src.llm_client import (
     LLMConfigurationError,
     LLMClientError,
     LLMRetryableError,
+    OpenAIModelProvider,
     ScriptedMockProvider,
     get_call_model,
 )
-from src.model_protocol import ModelProtocolError, ModelResponse
+from src.model_protocol import ModelProtocolError, ModelResponse, ToolCall
 
 
 def test_scripted_mock_provider_returns_internal_responses_and_records_requests():
@@ -406,3 +407,331 @@ def test_openai_http_503_raises_after_limited_attempts(monkeypatch):
 
     assert len(request_arguments) == 3  # 三次尝试均失败
     assert delays == [0.25, 0.5]  # 两次退避（最后一次失败后不再 sleep）
+
+
+# ---------------------------------------------------------------------------
+# OpenAIModelProvider — M7-10 real provider function-calling adaptation
+#
+# All tests below inject a FakeOpenAI via monkeypatch so no real API is called.
+# The fake mimics the OpenAI Responses API response shape (output items +
+# usage + status) that _parse_sdk_response reads via getattr.
+# ---------------------------------------------------------------------------
+
+
+def _tool_schema(name, description, parameters_schema):
+    """Build a minimal tool-like object for schema conversion tests."""
+    return SimpleNamespace(name=name, description=description, parameters_schema=parameters_schema)
+
+
+def _sdk_message_item(text):
+    """Build a Responses-API message output item carrying output_text."""
+    return SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text=text)],
+    )
+
+
+def _sdk_function_call_item(call_id, name, arguments):
+    """Build a Responses-API function_call output item (arguments is a JSON string)."""
+    return SimpleNamespace(type="function_call", call_id=call_id, name=name, arguments=arguments)
+
+
+def _sdk_response(output_items, *, usage=None, status="completed"):
+    """Build a minimal SDK response object compatible with _parse_sdk_response."""
+    return SimpleNamespace(output=output_items, usage=usage, status=status)
+
+
+def _make_fake_openai(sdk_responses, captured):
+    """Create a FakeOpenAI class that returns scripted SDK responses.
+
+    ``captured`` is a dict mutated in place so tests can assert on client
+    construction kwargs and create() kwargs after the call.
+    """
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            captured["create_kwargs"].append(kwargs)
+            if captured["index"] >= len(sdk_responses):
+                raise RuntimeError("fake_sdk_exhausted")
+            item = sdk_responses[captured["index"]]
+            captured["index"] += 1
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"].append(kwargs)
+            self.responses = FakeResponses()
+
+    return FakeOpenAI
+
+
+def _two_tools():
+    return [
+        _tool_schema(
+            "get_changed_hunks",
+            "Return changed hunks for one path.",
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool_schema(
+            "finish_review",
+            "Terminate the review.",
+            {
+                "type": "object",
+                "properties": {"findings": {"type": "array"}},
+                "required": ["findings"],
+                "additionalProperties": False,
+            },
+        ),
+    ]
+
+
+def _setup_provider(monkeypatch, sdk_responses, tools=None):
+    """Wire a FakeOpenAI into sys.modules and return (provider, captured)."""
+    captured = {"create_kwargs": [], "client_kwargs": [], "index": 0}
+    fake_openai = _make_fake_openai(sdk_responses, captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai))
+    provider = OpenAIModelProvider(tools or _two_tools(), timeout_seconds=5.0)
+    return provider, captured
+
+
+def test_openai_provider_converts_internal_tool_schemas_to_sdk_format():
+    """Schema conversion happens at construction and is inspectable."""
+    provider = OpenAIModelProvider(_two_tools())
+
+    assert provider.sdk_tools == (
+        {
+            "type": "function",
+            "name": "get_changed_hunks",
+            "description": "Return changed hunks for one path.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "finish_review",
+            "description": "Terminate the review.",
+            "parameters": {
+                "type": "object",
+                "properties": {"findings": {"type": "array"}},
+                "required": ["findings"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+
+def test_openai_provider_rejects_invalid_tool_schema():
+    """Bad tool schemas fail at construction, not during a live SDK call."""
+    with pytest.raises(LLMConfigurationError, match="tool_name_must_be_a_non_empty_string"):
+        OpenAIModelProvider([_tool_schema("", "desc", {})])
+    with pytest.raises(LLMConfigurationError, match="tool_parameters_schema_must_be_an_object"):
+        OpenAIModelProvider([_tool_schema("ok", "desc", None)])
+
+
+def test_openai_provider_parses_text_only_response_without_tool_calls(monkeypatch):
+    """No-call: SDK returns only a text message → ModelResponse with text, empty calls."""
+    provider, captured = _setup_provider(
+        monkeypatch,
+        [_sdk_response([_sdk_message_item("Nothing to report.")], usage=SimpleNamespace(input_tokens=8, output_tokens=3, total_tokens=11))],
+    )
+
+    response = provider.complete({"history": [{"role": "user", "content": "review"}]})
+
+    assert isinstance(response, ModelResponse)
+    assert response.text == "Nothing to report."
+    assert response.tool_calls == ()
+    assert response.finish_reason == "completed"
+    assert response.usage == {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11}
+    # The converted tool schemas must reach the SDK as the tools parameter.
+    assert captured["create_kwargs"][0]["tools"] == list(provider.sdk_tools)
+    assert captured["create_kwargs"][0]["timeout"] == 5.0
+    assert captured["client_kwargs"][0]["max_retries"] == 0
+
+
+def test_openai_provider_parses_single_tool_call(monkeypatch):
+    """Single-call: one function_call item → ModelResponse with one ToolCall."""
+    provider, _ = _setup_provider(
+        monkeypatch,
+        [_sdk_response(
+            [_sdk_function_call_item("call-1", "get_changed_hunks", '{"path": "src/app.py"}')],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )],
+    )
+
+    response = provider.complete({"history": [{"role": "user", "content": "review"}]})
+
+    assert response.text is None
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.call_id == "call-1"
+    assert call.name == "get_changed_hunks"
+    assert call.arguments == {"path": "src/app.py"}
+
+
+def test_openai_provider_parses_multiple_tool_calls_and_text(monkeypatch):
+    """Multi-call + text: mixed output → ModelResponse retains both."""
+    provider, _ = _setup_provider(
+        monkeypatch,
+        [_sdk_response(
+            [
+                _sdk_message_item("I need two checks."),
+                _sdk_function_call_item("call-1", "get_changed_hunks", '{"path": "src/app.py"}'),
+                _sdk_function_call_item("call-2", "read_file_context", '{"path": "src/utils.py"}'),
+            ],
+            usage=SimpleNamespace(input_tokens=20, output_tokens=10, total_tokens=30),
+        )],
+    )
+
+    response = provider.complete({"history": [{"role": "user", "content": "review"}]})
+
+    assert response.text == "I need two checks."
+    assert [c.call_id for c in response.tool_calls] == ["call-1", "call-2"]
+    assert [c.name for c in response.tool_calls] == ["get_changed_hunks", "read_file_context"]
+    assert response.tool_calls[0].arguments == {"path": "src/app.py"}
+    assert response.tool_calls[1].arguments == {"path": "src/utils.py"}
+    assert response.usage["total_tokens"] == 30
+
+
+def test_openai_provider_bad_json_arguments_raises_model_protocol_error(monkeypatch):
+    """Bad JSON: malformed arguments string → ModelProtocolError, not a silent {}."""
+    provider, _ = _setup_provider(
+        monkeypatch,
+        [_sdk_response([_sdk_function_call_item("call-1", "get_changed_hunks", "{bad json")])],
+    )
+
+    with pytest.raises(ModelProtocolError, match="tool_call_arguments_invalid_json"):
+        provider.complete({"history": []})
+
+
+def test_openai_provider_timeout_maps_to_retryable_error(monkeypatch):
+    """Timeout: SDK raises APITimeoutError → LLMRetryableError (controller owns retry)."""
+
+    class APITimeoutError(Exception):
+        pass
+
+    provider, _ = _setup_provider(monkeypatch, [APITimeoutError("provider timed out")])
+
+    with pytest.raises(LLMRetryableError, match="openai_call_failed:provider timed out"):
+        provider.complete({"history": []})
+
+
+def test_openai_provider_http_503_maps_to_retryable_error(monkeypatch):
+    """Provider error: 503 → LLMRetryableError, classified via _is_retryable_provider_error."""
+
+    class ProviderUnavailable(Exception):
+        status_code = 503
+
+    provider, _ = _setup_provider(monkeypatch, [ProviderUnavailable("service unavailable")])
+
+    with pytest.raises(LLMRetryableError, match="openai_call_failed:service unavailable"):
+        provider.complete({"history": []})
+
+
+def test_openai_provider_non_retryable_error_maps_to_client_error(monkeypatch):
+    """Non-retryable SDK error → LLMClientError (not retried by the controller)."""
+
+    class BadRequest(Exception):
+        status_code = 400
+
+    provider, _ = _setup_provider(monkeypatch, [BadRequest("bad request")])
+
+    with pytest.raises(LLMClientError, match="openai_call_failed:bad request"):
+        provider.complete({"history": []})
+
+
+def test_openai_provider_missing_api_key_raises_configuration_error(monkeypatch):
+    """Missing API key → LLMConfigurationError before any SDK import or call."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    provider = OpenAIModelProvider(_two_tools())
+
+    with pytest.raises(LLMConfigurationError, match="missing_OPENAI_API_KEY"):
+        provider.complete({"history": []})
+
+
+def test_openai_provider_passes_converted_history_as_sdk_input(monkeypatch):
+    """The controller's JSON-safe history is converted to SDK input items."""
+    provider, captured = _setup_provider(
+        monkeypatch,
+        [_sdk_response([_sdk_function_call_item("call-1", "finish_review", '{"findings": []}')])],
+    )
+
+    provider.complete(
+        {
+            "history": [
+                {"role": "user", "content": "review this diff"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"call_id": "prev-1", "name": "get_changed_hunks", "arguments": {"path": "src/app.py"}},
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "call_id": "prev-1",
+                    "name": "get_changed_hunks",
+                    "result": {"success": True, "data": {"path": "src/app.py"}},
+                },
+            ]
+        }
+    )
+
+    input_items = captured["create_kwargs"][0]["input"]
+    assert input_items[0] == {"role": "user", "content": "review this diff"}
+    # Assistant with no content but tool_calls emits only function_call items.
+    assert input_items[1] == {
+        "type": "function_call",
+        "call_id": "prev-1",
+        "name": "get_changed_hunks",
+        "arguments": '{"path": "src/app.py"}',
+    }
+    # Tool results become function_call_output with a JSON string.
+    assert input_items[2]["type"] == "function_call_output"
+    assert input_items[2]["call_id"] == "prev-1"
+
+
+def test_openai_provider_with_no_tools_omits_tools_parameter(monkeypatch):
+    """An empty tool set must not send tools=None or tools=[] to the SDK."""
+    captured = {"create_kwargs": [], "client_kwargs": [], "index": 0}
+    fake_openai = _make_fake_openai(
+        [_sdk_response([_sdk_message_item("done")])], captured,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai))
+    provider = OpenAIModelProvider([])
+
+    provider.complete({"history": [{"role": "user", "content": "hi"}]})
+
+    assert "tools" not in captured["create_kwargs"][0]
+
+
+def test_openai_provider_missing_usage_returns_empty_dict(monkeypatch):
+    """A response without a usage object yields an empty usage dict, not None."""
+    provider, _ = _setup_provider(
+        monkeypatch,
+        [_sdk_response([_sdk_message_item("ok")], usage=None)],
+    )
+
+    response = provider.complete({"history": []})
+    assert response.usage == {}
+
+
+def test_openai_provider_satisfies_model_provider_protocol():
+    """OpenAIModelProvider is structurally compatible with the ModelProvider Protocol."""
+    from src.react_controller import ModelProvider
+
+    provider = OpenAIModelProvider(_two_tools())
+    assert isinstance(provider, ModelProvider)
+

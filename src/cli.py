@@ -102,6 +102,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--review-mode",
+        choices=["fixed", "react"],
+        default="fixed",
+        help="Review pipeline mode. 'fixed' (default) uses the existing "
+             "single-call LLM review; 'react' delegates to the tool-calling "
+             "ReAct controller loop.",
+    )
+
+    parser.add_argument(
     "--max-extra-context-files",
     type=int,
     default=3,
@@ -280,6 +289,7 @@ def run_review_agent(args):
         trace_dir=args.trace_dir,
         publish_summary_comment=getattr(args, "publish_summary_comment", False),
         pull_request=pull_request,
+        review_mode=getattr(args, "review_mode", "fixed"),
     )
     # 将 GitHubPRProvider 作为工厂注入，ReviewService 内部按需实例化 Provider
     result = ReviewService(git_provider_factory=GitHubPRProvider).review(request)

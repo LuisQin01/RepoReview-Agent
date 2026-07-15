@@ -73,6 +73,11 @@ class ReviewState:
     use_llm:bool
     context_budget:ContextBudget
     llm_provider:str="mock"
+    # review_mode drives the pipeline branch: "fixed" (default, existing single-call
+    # pipeline) or "react" (multi-turn tool-calling loop).  Invalid values must be
+    # rejected at the service boundary before state is created.
+    review_mode:str="fixed"
+
 
     diff_text:str=""
     changed_files:List[ChangedFile]=field(default_factory=list)
@@ -93,4 +98,14 @@ class ReviewState:
     # perf_counter 为单调高精度计时器，记录起始时刻用于计算 pipeline 总耗时与各阶段耗时。
     started_at_perf:float=field(default_factory=perf_counter)
     trace_path:str=""
+
+    # ReAct counters live on the one review state so a budget stop remains
+    # distinguishable from a model-authored ``finish_review`` in later traces.
+    react_steps:int=0
+    react_llm_calls:int=0
+    react_total_tokens:int=0
+    react_tool_result_bytes:int=0
+    react_tool_results_truncated:int=0
+    react_termination_reason:str=""
+    react_degraded:bool=False
 

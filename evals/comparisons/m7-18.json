@@ -1,0 +1,504 @@
+{
+  "commit": "d311fa9a60fbe3df59dca0ffd1886b07194a96f3",
+  "comparison": {
+    "aggregate_diff": {
+      "cost_delta_usd": 0.0030359999999999996,
+      "f1_delta": 0.09523809523809523,
+      "llm_call_delta": 13,
+      "p95_latency_delta_ms": -18.0,
+      "precision_delta": 0.05555555555555558,
+      "recall_delta": 0.19999999999999996,
+      "token_delta": 9200
+    },
+    "per_case_diff": [
+      {
+        "case_id": "clean_change_no_issue",
+        "fixed_actual_categories": [],
+        "fixed_false_negatives": [],
+        "fixed_passed": true,
+        "new_false_positives": [],
+        "react_actual_categories": [],
+        "react_passed": true
+      },
+      {
+        "case_id": "deleted_exception_handling",
+        "fixed_actual_categories": [
+          "exception_handling",
+          "test_gap"
+        ],
+        "fixed_false_negatives": [],
+        "fixed_passed": false,
+        "new_false_positives": [],
+        "react_actual_categories": [
+          "exception_handling",
+          "test_gap"
+        ],
+        "react_passed": false
+      },
+      {
+        "case_id": "hardcoded_secret",
+        "fixed_actual_categories": [
+          "secret",
+          "test_gap"
+        ],
+        "fixed_false_negatives": [],
+        "fixed_passed": false,
+        "new_false_positives": [],
+        "react_actual_categories": [
+          "secret",
+          "test_gap"
+        ],
+        "react_passed": false
+      },
+      {
+        "case_id": "missing_test",
+        "fixed_actual_categories": [
+          "test_gap"
+        ],
+        "fixed_false_negatives": [],
+        "fixed_passed": true,
+        "new_false_positives": [],
+        "react_actual_categories": [
+          "test_gap"
+        ],
+        "react_passed": true
+      },
+      {
+        "case_id": "sensitive_log",
+        "fixed_actual_categories": [
+          "debug",
+          "secret",
+          "sensitive_log",
+          "test_gap"
+        ],
+        "fixed_false_negatives": [],
+        "fixed_passed": false,
+        "new_false_positives": [],
+        "react_actual_categories": [
+          "debug",
+          "secret",
+          "sensitive_log",
+          "test_gap"
+        ],
+        "react_passed": false
+      },
+      {
+        "case_id": "uncaught_card_decline",
+        "fixed_actual_categories": [],
+        "fixed_false_negatives": [
+          "exception_handling"
+        ],
+        "fixed_passed": false,
+        "new_false_positives": [],
+        "react_actual_categories": [
+          "exception_handling"
+        ],
+        "react_passed": true
+      }
+    ]
+  },
+  "configuration": {
+    "cases": "evals/cases",
+    "context_budget": {
+      "max_extra_context_files": 3,
+      "max_prompt_chars": 4000
+    },
+    "llm_provider": "mock",
+    "react_budget": {
+      "max_llm_calls": 8,
+      "max_steps": 8,
+      "max_tool_result_bytes": 8000,
+      "max_total_tokens": 16000,
+      "max_total_tool_result_bytes": 32000
+    },
+    "repo": "."
+  },
+  "environment": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python_version": "3.11.7 | packaged by Anaconda, Inc. | (main, Dec 15 2023, 18:05:47) [MSC v.1916 64 bit (AMD64)]"
+  },
+  "fixed": {
+    "average_duration_ms": 619.5,
+    "average_findings": 1.6666666666666667,
+    "budget_exhausted_count": 0,
+    "cases": 6,
+    "category_hit_rate": 0.3333333333333333,
+    "estimated_cost_usd": 0.0,
+    "f1": 0.5714285714285714,
+    "false_negative_count": 1,
+    "false_positive_count": 3,
+    "false_positive_rate": 0.0,
+    "json_valid_rate": 1.0,
+    "p95_duration_ms": 779.0,
+    "precision": 0.4444444444444444,
+    "recall": 0.8,
+    "results": [
+      {
+        "actual_categories": [],
+        "budget_exhausted": false,
+        "case_id": "clean_change_no_issue",
+        "duration_ms": 779,
+        "error": "",
+        "expected_categories": [],
+        "false_positive": false,
+        "findings_count": 0,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": true,
+        "json_valid": true,
+        "passed": true,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 0,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "exception_handling",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "deleted_exception_handling",
+        "duration_ms": 692,
+        "error": "",
+        "expected_categories": [
+          "exception_handling"
+        ],
+        "false_positive": true,
+        "findings_count": 3,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "secret",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "hardcoded_secret",
+        "duration_ms": 738,
+        "error": "",
+        "expected_categories": [
+          "secret"
+        ],
+        "false_positive": true,
+        "findings_count": 2,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "missing_test",
+        "duration_ms": 761,
+        "error": "",
+        "expected_categories": [
+          "test_gap"
+        ],
+        "false_positive": false,
+        "findings_count": 1,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": true,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "debug",
+          "secret",
+          "sensitive_log",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "sensitive_log",
+        "duration_ms": 717,
+        "error": "",
+        "expected_categories": [
+          "sensitive_log"
+        ],
+        "false_positive": true,
+        "findings_count": 4,
+        "fn": 0,
+        "fp": 3,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [],
+        "budget_exhausted": false,
+        "case_id": "uncaught_card_decline",
+        "duration_ms": 30,
+        "error": "",
+        "expected_categories": [
+          "exception_handling"
+        ],
+        "false_positive": false,
+        "findings_count": 0,
+        "fn": 1,
+        "fp": 0,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 0,
+        "react_steps": 0,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 0,
+        "review_mode": "fixed",
+        "tp": 0,
+        "unknown_tool_count": 0
+      }
+    ],
+    "total_llm_calls": 0,
+    "total_tokens": 0,
+    "unknown_tool_count": 0
+  },
+  "react": {
+    "average_duration_ms": 578.0,
+    "average_findings": 1.8333333333333333,
+    "budget_exhausted_count": 0,
+    "cases": 6,
+    "category_hit_rate": 0.5,
+    "estimated_cost_usd": 0.0030359999999999996,
+    "f1": 0.6666666666666666,
+    "false_negative_count": 0,
+    "false_positive_count": 3,
+    "false_positive_rate": 0.0,
+    "json_valid_rate": 1.0,
+    "p95_duration_ms": 761.0,
+    "precision": 0.5,
+    "recall": 1.0,
+    "results": [
+      {
+        "actual_categories": [],
+        "budget_exhausted": false,
+        "case_id": "clean_change_no_issue",
+        "duration_ms": 731,
+        "error": "",
+        "expected_categories": [],
+        "false_positive": false,
+        "findings_count": 0,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": true,
+        "json_valid": true,
+        "passed": true,
+        "react_degraded": false,
+        "react_llm_calls": 2,
+        "react_steps": 2,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 1300,
+        "review_mode": "react",
+        "tp": 0,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "exception_handling",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "deleted_exception_handling",
+        "duration_ms": 761,
+        "error": "",
+        "expected_categories": [
+          "exception_handling"
+        ],
+        "false_positive": true,
+        "findings_count": 3,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 2,
+        "react_steps": 2,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 1300,
+        "review_mode": "react",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "secret",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "hardcoded_secret",
+        "duration_ms": 613,
+        "error": "",
+        "expected_categories": [
+          "secret"
+        ],
+        "false_positive": true,
+        "findings_count": 2,
+        "fn": 0,
+        "fp": 1,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 2,
+        "react_steps": 2,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 1300,
+        "review_mode": "react",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "missing_test",
+        "duration_ms": 678,
+        "error": "",
+        "expected_categories": [
+          "test_gap"
+        ],
+        "false_positive": false,
+        "findings_count": 1,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": true,
+        "react_degraded": false,
+        "react_llm_calls": 2,
+        "react_steps": 2,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 1300,
+        "review_mode": "react",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "debug",
+          "secret",
+          "sensitive_log",
+          "test_gap"
+        ],
+        "budget_exhausted": false,
+        "case_id": "sensitive_log",
+        "duration_ms": 637,
+        "error": "",
+        "expected_categories": [
+          "sensitive_log"
+        ],
+        "false_positive": true,
+        "findings_count": 4,
+        "fn": 0,
+        "fp": 3,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": false,
+        "react_degraded": false,
+        "react_llm_calls": 2,
+        "react_steps": 2,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 1300,
+        "review_mode": "react",
+        "tp": 1,
+        "unknown_tool_count": 0
+      },
+      {
+        "actual_categories": [
+          "exception_handling"
+        ],
+        "budget_exhausted": false,
+        "case_id": "uncaught_card_decline",
+        "duration_ms": 48,
+        "error": "",
+        "expected_categories": [
+          "exception_handling"
+        ],
+        "false_positive": false,
+        "findings_count": 1,
+        "fn": 0,
+        "fp": 0,
+        "is_negative_case": false,
+        "json_valid": true,
+        "passed": true,
+        "react_degraded": false,
+        "react_llm_calls": 3,
+        "react_steps": 3,
+        "react_termination_reason": "",
+        "react_tool_results_truncated": 0,
+        "react_total_tokens": 2700,
+        "review_mode": "react",
+        "tp": 1,
+        "unknown_tool_count": 0
+      }
+    ],
+    "total_llm_calls": 13,
+    "total_tokens": 9200,
+    "unknown_tool_count": 0
+  },
+  "reproduction": {
+    "command": "py -m src.eval_runner --cases evals/cases --repo . --compare-modes --comparison-output evals/comparisons/m7-18.json"
+  },
+  "schema_version": "m7_comparison.v1",
+  "worktree_diff_sha256": "16a05235d891ea228ce275ad1acd7c8440642b9ac5cc4f8ad7afc9e784088ee8",
+  "worktree_state": "dirty"
+}

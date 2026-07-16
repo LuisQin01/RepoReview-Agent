@@ -191,21 +191,30 @@ class ToolDispatcher:
     def _object_matches_schema(value: JSONValue, schema: dict[str, JSONValue]) -> bool:
         """Validate every object level so nested keys cannot bypass the whitelist."""
         if not isinstance(value, dict) or schema.get("additionalProperties") is not False:
+            # 硬性要求 schema 显式声明 additionalProperties=False：这是安全白名单的
+            # 关键防线。若允许额外属性，模型可在 tools 参数里塞入工具未声明、系统未
+            # 预期的字段（参数注入），从而扩大攻击面。因此“未明确禁止额外属性”即判不合法。
             return False
 
         properties = schema.get("properties")
         required = schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
             return False
+        # required 中的每个名字都必须是字符串且确实在 properties 中声明过，
+        # 防止 schema 自身自相矛盾（声明必填却没定义该字段）。
         if not all(isinstance(name, str) and name in properties for name in required):
             return False
+        # properties 的每个字段名与规则本身都必须是合法的（名是字符串、规则是 dict）。
         if not all(isinstance(name, str) and isinstance(rule, dict) for name, rule in properties.items()):
             return False
+        # 入参缺失任一 required 字段 → 不合法（契约不可违反）。
         if any(name not in value for name in required):
             return False
+        # 入参多出任何 properties 之外的字段 → 不合法（白名单之外一律拒绝）。
         if any(name not in properties for name in value):
             return False
 
+        # 逐字段递归校验：仅对“实际出现的字段”做 schema 匹配，嵌套结构同样受白名单约束。
         return all(
             ToolDispatcher._value_matches_schema(value[name], rule)
             for name, rule in properties.items()

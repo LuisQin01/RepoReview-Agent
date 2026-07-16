@@ -130,27 +130,44 @@ class ReActController:
         request, history = self._initial_request(initial_request)
         self._reset_state()
 
+        # ── ReAct 主循环：模型每轮可调用 0~N 个工具，直到 finish_review 终止 ──
+        # 核心不变量：任何一轮调用模型之前，先经过预算熔断检查；
+        # 一旦预算耗尽，立即返回一个“非完成”的降级结果，绝不假装审查成功。
         while True:
+            # 熔断检查：若某类预算（步数/调用数/token/工具结果字节）已达上限，
+            # 直接返回降级结果。注意这是“调用模型之前”的守门，保证不会超支。
             termination = self._pre_call_termination()
             if termination is not None:
                 return termination
 
+            # 两个计数器先于模型调用递增：即使本次调用随后失败，
+            # 也会计入“已用步数/调用数”，避免无限重试刷爆预算。
             self._increment("react_steps")
             self._increment("react_llm_calls")
             response = self._provider.complete(request)
             token_count = self._response_token_count(response)
             if token_count is None:
+                # 用量异常（缺失/非数值）：无法核算 token 预算，按不可用降级，
+                # 而非猜测一个 0 继续跑——宁可不审查也不制造虚假成功。
                 return self._terminate("unavailable")
             self._increment("react_total_tokens", token_count)
             if not response.tool_calls:
+                # 关键边界：模型返回了响应但一个工具都没调用、也没终止。
+                # 这种响应无法证明“审查已完成”，因此抛 unavailable，
+                # 而不是凭空返回一个空 findings 列表（空列表会被误读为“审查通过”）。
                 raise ReActControllerError("unavailable")
 
+            # 将本轮模型的 assistant 消息（含其产生的 tool_calls）追加进历史，
+            # 保证下一轮请求能带上完整上下文。注意：这里记录的是“声明”的工具调用，
+            # 真正执行的工具结果在下面循环中逐个回灌。
             history.append(self._assistant_event(response))
             for call in response.tool_calls:
                 if call.name == self._finish_review.name:
+                    # 本轮出现“结束审查”调用：交给 FinishReview 做校验与收敛。
                     result = self._finish_review.finish(call.arguments)
                     if result.finished:
-                        # Finish is terminal: later calls in this response must never run.
+                        # 终止具有不可逆性：本响应里后面的工具调用一律不再执行，
+                        # 直接以 finish 记录并立即返回，避免“已结束又跑工具”的混乱。
                         self._record_termination(
                             "finish",
                             success=True,
@@ -166,9 +183,12 @@ class ReActController:
                             model_usage=response.usage,
                         )
                         return result
+                    # 入参非法（如缺 findings 字段）不会终止循环：把拒绝原因作为
+                    # 一条 tool 结果回灌给模型，让它纠正后重新发起正确的 finish 调用。
                     history.append(self._finish_event(call.call_id, result.status))
                     continue
 
+                # 普通工具调用：先派发执行，再走“单一边界守卫”脱敏/截断后才进历史。
                 started_at = perf_counter()
                 tool_result = self._dispatcher.dispatch(call.name, call.arguments)
                 guarded_result = self._guard_tool_result(
@@ -185,9 +205,13 @@ class ReActController:
                     model_usage=response.usage,
                 )
                 if self._tool_bytes() + guarded_result.result_bytes > self._budget.max_total_tool_result_bytes:
-                    # Do not let a same-turn second tool bypass the cumulative history cap.
+                    # 累计护栏：跨多个工具的回灌结果总字节一旦超上限即终止。
+                    # 在回灌历史之前用“当前累计 + 本次结果”判断，防止同一响应里
+                    # 的第二个工具绕过总额上限，制造超长历史污染后续模型输入。
                     return self._terminate("max_tool_result_bytes_exhausted")
                 self._increment("react_tool_result_bytes", guarded_result.result_bytes)
+                # 仅当未超累计上限时，才把本次工具结果作为 tool 消息回灌进历史，
+                # 供下一轮模型请求使用（工具结果与 call_id 绑定，不靠列表顺序关联）。
                 history.append(
                     self._tool_event(call.call_id, call.name, guarded_result.history_result)
                 )

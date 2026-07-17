@@ -307,22 +307,48 @@ class ReActController:
         name: str,
         result: dict[str, JSONValue],
     ) -> _GuardedToolResult:
-        """Apply the single M3-derived boundary before history or trace sees data."""
+        """Apply the single M3-derived boundary before history or trace sees data.
+
+        这是整个控制器唯一的“出口边界”：任何工具的结果在被写进模型历史（history）
+        或写进 trace 之前，都必须经过本函数统一净化。所有“敏感脱敏 / 路径归一化 /
+        失败信息剥离 / 字节预算截断”都在这里集中完成，工具自身不需要关心这些，
+        从而保证净化逻辑只有一处、不会遗漏。
+
+        处理顺序（层层收敛）：
+          1) 递归脱敏结构化数据（redact_sensitive_structure）；
+          2) 校验并归一化所有 path 类字段，敏感或非法路径整体替换为 forbidden 结果；
+          3) 按 success 与否，剥离工具原始诊断，只保留稳定 code + 结构化 data；
+          4) 若净化后体积超单条结果字节预算，则丢弃 data 并标记为 truncated，
+             用“显式不完整”代替“偷偷截断”，避免不完整内容被误读为结论。
+        """
+        # 步骤 1：对工具返回的结构化数据做递归脱敏（密钥/Token 等被替换占位符）。
+        # _json_copy 同时确保所有值都是合法 JSON，杜绝非 JSON 对象进入边界。
         safe_result = self._json_copy(redact_sensitive_structure(result))
         if not isinstance(safe_result, dict):  # ToolResult already promises an object.
             raise ReActControllerError("internal_error")
 
+        # 步骤 2：遍历结果中所有 path/old_path/file_path 字段，归一化为仓库相对路径，
+        # 一旦遇到敏感文件或非法路径，整个结果被替换成统一的 forbidden 占位结果。
         try:
             safe_result = self._sanitize_result_paths(safe_result)
         except ValueError:
             # A rejected path must not survive as a diagnostic in either sink.
             safe_result = self._forbidden_result()
+
+        # 步骤 3：按成功/失败分流，统一清洗为“模型所见”的投影。
         if safe_result.get("success") is False:
+            # 失败结果只保留稳定的 error_code，绝不把工具原始诊断（可能含主机信息）
+            # 下发给模型——失败是“带状态码的状态”，不是主机诊断的载体。
             # Tool failures are status-bearing, never a carrier for host diagnostics.
             safe_result = self._failure_result(safe_result)
         else:
+            # 成功结果只保留结构化 data 与用量，summary 改写为中性提示，
+            # 绝不回显不可信的源文本。
             safe_result = self._success_result(safe_result)
 
+        # 步骤 4：单条结果字节预算熔断。计算净化后的 UTF-8 JSON 字节数；若超出
+        # max_tool_result_bytes，则丢弃 data 并标记 truncated——宁可少给也不要把
+        # 一个被“切了一半”的代码片段喂给模型（半截代码可能被误判为完整结论）。
         result_bytes = self._json_size(safe_result)
         was_truncated = bool(safe_result["truncated"])
         if result_bytes > self._budget.max_tool_result_bytes:
@@ -332,6 +358,9 @@ class ReActController:
             result_bytes = self._json_size(safe_result)
             was_truncated = True
 
+        # 组装成“历史投影 + trace 摘要 + 字节数”三元组返回给调用方。
+        # 注意 history_result 与 trace_summary 都来自同一个 safe_result，
+        # 二者共享同一份净化结果，避免历史与 trace 出现不一致。
         return _GuardedToolResult(
             history_result=safe_result,
             trace_summary={
@@ -429,21 +458,33 @@ class ReActController:
 
     @staticmethod
     def _sanitize_result_paths(value: JSONValue) -> JSONValue:
-        """Normalize path fields or reject them before they reach either sink."""
+        """Normalize path fields or reject them before they reach either sink.
+
+        递归遍历工具结果（dict/list/标量），对其中所有 path 类字段做“归一化 +
+        敏感/越界拒绝”处理。只要命中一个非法路径就抛 ValueError，由调用方
+        _guard_tool_result 统一把整条结果降级为 forbidden，保证非法路径既不会进入
+        模型历史，也不会进入 trace。
+        """
         if isinstance(value, dict):
             sanitized: dict[str, JSONValue] = {}
             for key, item in value.items():
+                # 只对显式登记为路径的字段做特殊处理，其余字段原样递归净化。
                 if key in {"path", "old_path", "file_path"} and item is not None:
                     if not isinstance(item, str):
+                        # 路径必须是字符串，其它类型视为格式非法。
                         raise ValueError("tool_result_path_must_be_a_string")
+                    # 归一化为仓库相对规范路径（会拒绝绝对路径与 ".." 越界）。
                     normalized_path = _normalize_file_context_path(item)
                     if _is_sensitive_file_path(normalized_path):
+                        # 命中敏感文件清单（如密钥文件）直接拒绝，路径不上链。
                         raise ValueError("tool_result_path_is_sensitive")
                     sanitized[key] = normalized_path
                 else:
+                    # 非路径字段：继续向下递归，确保嵌套结构里的路径也被覆盖。
                     sanitized[key] = ReActController._sanitize_result_paths(item)
             return sanitized
         elif isinstance(value, list):
+            # 列表同样逐元素递归。
             return [ReActController._sanitize_result_paths(item) for item in value]
         return value
 

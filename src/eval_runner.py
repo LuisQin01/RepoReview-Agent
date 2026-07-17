@@ -19,6 +19,7 @@ import argparse
 from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 from time import perf_counter
 import platform
@@ -35,6 +36,7 @@ from .schemas import ContextBudget
 
 
 BASELINE_SCHEMA_VERSION = "m7_fixed_baseline.v1"
+SINGLE_BASELINE_SCHEMA_VERSION = "m8_single_baseline.v1"
 COMPARISON_SCHEMA_VERSION = "m7_comparison.v1"
 
 # Tool names registered by the ReAct dispatcher; any other name is "unknown".
@@ -127,6 +129,7 @@ def capture_source_revision(
     repo_root: Path,
     *,
     excluded_untracked_paths: Iterable[str | Path] = (),
+    include_untracked: bool = False,
 ) -> SourceRevision:
     """Return the current Git commit and a verifiable snapshot of local changes.
 
@@ -142,7 +145,10 @@ def capture_source_revision(
     sibling outputs under the same directory do not block regenerating a new
     output in that directory.  Exact file matches continue to exclude only the
     named file, preserving the established single-output rerun contract for
-    callers that do not opt into the directory-prefix form.
+    callers that do not opt into the directory-prefix form.  ``include_untracked``
+    is an explicit M8 single-baseline opt-in: untracked file paths and bytes are
+    included in the source hash; the established default still returns
+    ``unsupported`` for untracked source input.
     """
     def git_output(*arguments: str) -> bytes:
         try:
@@ -202,14 +208,41 @@ def capture_source_revision(
     # ``git diff HEAD`` deliberately excludes untracked files.  Recording its
     # hash would therefore misidentify a baseline whose cases or source files
     # differ only through untracked content.
-    if any(entry.startswith(b"?? ") for entry in retained_status_entries):
+    untracked_entries = sorted(
+        entry[3:]
+        for entry in retained_status_entries
+        if entry.startswith(b"?? ")
+        and b"/__pycache__/" not in entry[3:]
+        and not entry[3:].endswith(b".pyc")
+    )
+    if untracked_entries and not include_untracked:
         raise ValueError("unsupported")
 
     diff = git_output("diff", "--binary", "HEAD")
+    if include_untracked:
+        snapshot = hashlib.sha256()
+        snapshot.update(b"tracked-diff\0")
+        snapshot.update(diff)
+        for encoded_path in untracked_entries:
+            relative_path = os.fsdecode(encoded_path).replace("\\", "/")
+            candidate = (repo_root / Path(relative_path)).resolve()
+            try:
+                candidate.relative_to(repo_root)
+            except ValueError as exc:
+                raise ValueError("forbidden") from exc
+            if not candidate.is_file():
+                raise ValueError("unsupported")
+            snapshot.update(b"untracked\0")
+            snapshot.update(relative_path.encode("utf-8"))
+            snapshot.update(b"\0")
+            snapshot.update(candidate.read_bytes())
+        diff_hash = snapshot.hexdigest()
+    else:
+        diff_hash = hashlib.sha256(diff).hexdigest()
     return SourceRevision(
         commit=commit,
         worktree_state="dirty",
-        worktree_diff_sha256=hashlib.sha256(diff).hexdigest(),
+        worktree_diff_sha256=diff_hash,
     )
 
 def load_expected(case_dir: Path):
@@ -385,6 +418,57 @@ def _extract_react_observability(state):
     }
 
 
+def _extract_llm_observability(state):
+    """Return LLM calls and reported tokens without inventing fixed-mode usage.
+
+    The fixed reviewer exposes whether its single call happened through the
+    ``run_llm_review`` trace detail, but its text adapter does not expose token
+    counts.  ReAct counters remain authoritative when present; fixed-mode token
+    usage therefore stays zero and is documented as unavailable by the baseline
+    record rather than estimated from prompt characters.
+    """
+    trace_steps = getattr(state, "trace_steps", []) or []
+    called = sum(
+        1
+        for step in trace_steps
+        if step.get("step") == "run_llm_review"
+        and step.get("detail", {}).get("called") is True
+    )
+    react_calls = getattr(state, "react_llm_calls", 0) or 0
+    react_tokens = getattr(state, "react_total_tokens", 0) or 0
+    return {
+        "llm_calls": react_calls or called,
+        "total_tokens": react_tokens,
+        "token_usage_available": bool(react_tokens),
+    }
+
+
+def _fixed_llm_failure_error(state) -> str:
+    """Return a stable Eval error for a fatal fixed-mode LLM failure.
+
+    ``ReviewState.errors`` also contains repair warnings for usable LLM
+    findings, so it cannot be treated as an all-or-nothing failure flag.  The
+    fixed reviewer already records the authoritative outcome on its
+    ``run_llm_review`` trace step: provider failures have ``error`` and an
+    unusable response has ``valid=False``.  Only those signals fail the case.
+    """
+    trace_steps = getattr(state, "trace_steps", []) or []
+    for step in trace_steps:
+        if step.get("step") != "run_llm_review":
+            continue
+        detail = step.get("detail", {})
+        if detail.get("error"):
+            return "llm_provider_unavailable"
+        if detail.get("valid") is False:
+            validation_errors = detail.get("errors", [])
+            if isinstance(validation_errors, list) and validation_errors:
+                first_error = validation_errors[0]
+                if isinstance(first_error, str) and first_error:
+                    return f"llm_output_invalid:{first_error}"
+            return "llm_output_invalid"
+    return ""
+
+
 def run_one_case(
         case_dir: Path,
         repo_root: Path,
@@ -447,6 +531,13 @@ def run_one_case(
         # 从结构化结果中取 findings（state.issues）
         state = getattr(result, "state", None)
         findings = getattr(state, "issues", None)
+        fixed_llm_error = (
+            _fixed_llm_failure_error(state)
+            if use_llm and review_mode == "fixed"
+            else ""
+        )
+        if fixed_llm_error:
+            raise ValueError(fixed_llm_error)
         # 校验 findings 必须是 list
         if not isinstance(findings, list):
             raise ValueError(
@@ -484,8 +575,17 @@ def run_one_case(
     expected_categories=set(expected.get("expected_categories", []))
     should_find=expected.get("should_find", True)
 
+    # —— 判定本 case 是否通过 ——
+    # 关键设计：无论正向/负向，都严格要求“无任何 false positive（误报）”。
+    # 误报在审查系统里尤其危险——它会让开发者去排查根本不存在的问题。因此即便
+    # 漏掉了一些真实问题（FN），只要产生了误报，就认为该 case 未通过。
     if should_find:
-        # 正向 case：要求期望类别全部命中（子集关系）且无任何误报
+        # 正向 case（期望能发现问题）：
+        #   - 计算每个类别维度的 TP（命中期望类别）、FP（多出期望之外的类别）、
+        #     FN（期望里有但没命中的类别）；
+        #   - false_positive = 是否存在任何 FP（多出期望的类别，即误报）；
+        #   - passed 要求：①结果结构合法；②期望类别全部被命中（期望是实际的子集）；
+        #     ③没有任何误报。
         tp, fp, fn = _category_counts(actual_categories, expected_categories)
         false_positive = fp > 0
         passed = (
@@ -494,7 +594,10 @@ def run_one_case(
             and not false_positive
         )
     else:
-        # 负向 case：不应产生任何 finding，所有 finding 均视为误报
+        # 负向 case（期望不产出任何 finding，即“干净”样本）：
+        #   - 不应出现任何 finding；一旦出现，整条都算误报（fp = 全部 finding 数）；
+        #   - tp/fn 对负向样本无意义，置 0；
+        #   - passed 要求：①结果合法；②零误报（即 zero findings）。
         tp = 0
         fp = len(findings)
         fn = 0
@@ -516,6 +619,7 @@ def run_one_case(
         "duration_ms": duration_ms,
         "error": error,
         "review_mode": review_mode,
+        **_extract_llm_observability(state),
         **_extract_react_observability(state),
     }
 
@@ -594,6 +698,9 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock",
     durations = [result["duration_ms"] for result in results]
     total_tokens = sum(result.get("react_total_tokens", 0) for result in results)
     total_llm_calls = sum(result.get("react_llm_calls", 0) for result in results)
+    if use_llm and review_mode == "fixed":
+        total_tokens = sum(result.get("total_tokens", 0) for result in results)
+        total_llm_calls = sum(result.get("llm_calls", 0) for result in results)
     unknown_tool_count = sum(result.get("unknown_tool_count", 0) for result in results)
     budget_exhausted_count = sum(
         1 for result in results if result.get("budget_exhausted", False)
@@ -601,11 +708,11 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock",
 
     metrics = {
         "cases": case_count,
-        "category_hit_rate": passed_count / case_count if case_count else 0,
+        "category_hit_rate": passed_count / case_count if case_count else 0.0,
         "false_positive_count": false_positive_count,
-        "json_valid_rate": json_valid_count / case_count if case_count else 0,
-        "average_findings": total_findings / case_count if case_count else 0,
-        "average_duration_ms": total_duration / case_count if case_count else 0,
+        "json_valid_rate": json_valid_count / case_count if case_count else 0.0,
+        "average_findings": total_findings / case_count if case_count else 0.0,
+        "average_duration_ms": total_duration / case_count if case_count else 0.0,
         "p95_duration_ms": _percentile(durations, 95),
         "precision": precision,
         "recall": recall,
@@ -615,6 +722,8 @@ def run_eval(cases_dir, repo_root, use_llm=False, llm_provider="mock",
             false_positive_negative_case_count,
             negative_case_count,
         ),
+        "negative_case_count": negative_case_count,
+        "false_positive_negative_case_count": false_positive_negative_case_count,
         "false_negative_count": total_fn,
         "total_tokens": total_tokens,
         "total_llm_calls": total_llm_calls,
@@ -688,11 +797,17 @@ def _build_react_provider(case_dir, repo_root, changed_files):
     """
     first_path = changed_files[0].path if changed_files else ""
 
-    # Discover documentation files by scanning the case directory filesystem.
+    # 通过“扫描 case 目录文件系统”来发现文档文件（*.md）。
+    # 关键点：这里刻意不读取 case manifest 里的 repository_context / expected_*，
+    # 否则就等于把“标准答案”喂给了 react 分支，形成循环论证。fixed 分支看不到
+    # 这些元数据，react 分支也必须看不到，二者才公平可比。
     # This does NOT read repository_context from the case manifest, ensuring
     # the react arm has no answer-key metadata that the fixed arm lacks.
     doc_paths = _discover_documentation_files(case_dir, repo_root)
 
+    # 构造一个“脚本化 provider”：它模拟一个合理的模型——先看变更 hunk，再决定
+    # 是否读取证据文档并最终 finish。脚本是一组“模型回合”，每回合包含 tool_calls
+    # 与 usage。控制器会按脚本逐轮驱动，因此结果是确定可复现的，适合做对比评估。
     script = [
         {
             "tool_calls": [
@@ -851,16 +966,25 @@ def _build_per_case_diff(fixed_results, react_results):
     from fixed's actual AND absent from expected.  A *fixed false negative* is
     an expected category that fixed missed but react found.
     """
+    # 以 case_id 为稳定键（而非列表位置）关联两种模式的结果，避免顺序错位。
     react_by_id = {r["case_id"]: r for r in react_results}
     diffs = []
     for fixed_result in fixed_results:
         case_id = fixed_result["case_id"]
         react_result = react_by_id.get(case_id, {})
+        # 类别集合层面的对比：
+        #   expected_set  —— 期望命中类别（标准答案）
+        #   fixed_actual  —— fixed 模式实际命中类别
+        #   react_actual  —— react 模式实际命中类别
         expected_set = set(fixed_result["expected_categories"])
         fixed_actual = set(fixed_result["actual_categories"])
         react_actual = set(react_result.get("actual_categories", []))
 
+        # 新增误报 = react 命中、但 fixed 没命中、且期望里也没出现的类别。
+        # 即 react 模式“凭空多出来”的类别，是引入新风险的地方。
         new_false_positives = sorted(react_actual - fixed_actual - expected_set)
+        # 修复的漏报 = 期望里有、fixed 漏掉、但 react 命中的类别。
+        # 即 react 模式“补上了”fixed 没查出来的真实问题，是积极收益。
         fixed_false_negatives = sorted(
             (expected_set - fixed_actual) & react_actual
         )
@@ -1003,6 +1127,67 @@ def build_fixed_baseline_record(
     }
 
 
+def build_single_baseline_record(
+    metrics: dict,
+    *,
+    cases_dir: str,
+    repo_root: str,
+    llm_provider: str,
+    commit: str,
+    worktree_state: str,
+    worktree_diff_sha256: str | None,
+    baseline_output: str,
+) -> dict:
+    """Build the reproducible M8 single-call baseline record.
+
+    This record describes the explicit ``use_llm=True`` fixed pipeline.  The
+    existing fixed baseline builder remains unchanged for M7 compatibility.
+    """
+    context_budget = ContextBudget()
+    return {
+        "schema_version": SINGLE_BASELINE_SCHEMA_VERSION,
+        "review_mode": "fixed",
+        "commit": commit,
+        "worktree_state": worktree_state,
+        "worktree_diff_sha256": worktree_diff_sha256,
+        "configuration": {
+            "cases": cases_dir,
+            "repo": repo_root,
+            "use_llm": True,
+            "llm_provider": llm_provider,
+            "context_budget": {
+                "max_prompt_chars": context_budget.max_prompt_chars,
+                "max_extra_context_files": context_budget.max_extra_context_files,
+            },
+        },
+        "environment": {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+        },
+        "reproduction": {
+            "command": (
+                "py -m src.eval_runner "
+                f"--cases {cases_dir} --repo {repo_root} --llm "
+                f"--llm-provider {llm_provider} "
+                f"--baseline-output {baseline_output} "
+                f"--commit {commit} --worktree-state {worktree_state}"
+            ),
+        },
+        "observability": {
+            "llm_call_count": metrics["total_llm_calls"],
+            "token_usage": {
+                "available": metrics["total_tokens"] > 0,
+                "reason": (
+                    "fixed_text_adapter_does_not_expose_token_usage"
+                    if metrics["total_tokens"] == 0
+                    else "reported_by_review_state"
+                ),
+            },
+        },
+        "metrics": metrics,
+    }
+
+
 def write_baseline_record(output_path: str | Path, record: dict) -> None:
     """Persist a JSON baseline record, surfacing write failures to the caller.
 
@@ -1031,7 +1216,7 @@ def parse_args():
     parser.add_argument("--llm-provider", default="mock", choices=["mock", "openai"])
     parser.add_argument(
         "--baseline-output",
-        help="Optional path for a machine-readable M7 fixed-pipeline baseline JSON.",
+        help="Optional path for a machine-readable baseline JSON.",
     )
     parser.add_argument(
         "--commit",
@@ -1126,21 +1311,27 @@ def main():
     """评估器主入口：解析参数 → 跑全部 case → 打印指标与明细。"""
     args = parse_args()
 
+    # A single baseline is an offline reproducibility artifact.  Reject a real
+    # provider before comparison/Eval, source capture, output creation, or
+    # provider setup.
+    if (
+        args.baseline_output
+        and args.llm
+        and args.llm_provider != "mock"
+    ):
+        raise ValueError("single_baseline_requires_mock_provider")
+
     # Comparison mode runs both fixed and react and prints a diff summary.
     if args.compare_modes:
         _run_comparison_mode(args)
         return
-
-    # A fixed baseline must never execute the optional LLM path.  Validate
-    # before starting Eval so an invalid request cannot incur model calls.
-    if args.baseline_output and args.llm:
-        raise ValueError("fixed_baseline_requires_llm_disabled")
 
     source_revision = None
     if args.baseline_output:
         source_revision = capture_source_revision(
             Path(__file__).resolve().parent.parent,
             excluded_untracked_paths=_output_exclusion_paths(args.baseline_output),
+            include_untracked=args.llm,
         )
         if args.commit != "unknown" and args.commit != source_revision.commit:
             raise ValueError("fixed_baseline_commit_mismatch")
@@ -1158,16 +1349,19 @@ def main():
     )
 
     if args.baseline_output:
-        record = build_fixed_baseline_record(
-            metrics,
-            cases_dir=args.cases,
-            repo_root=args.repo,
-            llm_provider=args.llm_provider,
-            commit=source_revision.commit,
-            worktree_state=source_revision.worktree_state,
-            worktree_diff_sha256=source_revision.worktree_diff_sha256,
-            baseline_output=args.baseline_output,
+        record_builder = (
+            build_single_baseline_record if args.llm else build_fixed_baseline_record
         )
+        record = record_builder(
+                metrics,
+                cases_dir=args.cases,
+                repo_root=args.repo,
+                llm_provider=args.llm_provider,
+                commit=source_revision.commit,
+                worktree_state=source_revision.worktree_state,
+                worktree_diff_sha256=source_revision.worktree_diff_sha256,
+                baseline_output=args.baseline_output,
+            )
         write_baseline_record(args.baseline_output, record)
 
     # 打印全局汇总指标

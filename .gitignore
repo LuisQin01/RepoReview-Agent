@@ -1,0 +1,13 @@
+# 密钥与本地配置：绝不提交
+.env
+.env.*
+!.env.example
+
+# Python 缓存与测试产物
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地运行生成的 trace / 报告
+traces/
+*.full

@@ -27,9 +27,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import eval_runner
+from src import eval_runner, review_service
 from src.diff_parser import parse_diff
 from src.file_context import collect_file_contexts
+from src.llm_client import LLMClientError
 from src.reviewers import review_changed_files
 from src.review_service import ReviewRequest
 from src.schemas import ContextBudget, ReviewIssue
@@ -378,6 +379,72 @@ def test_run_one_case_marks_runner_failure_as_not_passed(tmp_path, monkeypatch):
     assert (result["tp"], result["fp"], result["fn"]) == (0, 0, 1)
 
 
+@pytest.mark.parametrize(
+    ("provider_result", "expected_error"),
+    [
+        ("provider_error", "llm_provider_unavailable"),
+        ("invalid_json", "llm_output_invalid:llm_json_parse_error"),
+    ],
+)
+def test_run_one_case_marks_fatal_fixed_llm_failures_as_not_passed(
+    tmp_path, monkeypatch, provider_result, expected_error
+):
+    """Provider and parse failures must fail a case through the real pipeline."""
+    case_dir = (
+        Path(__file__).resolve().parent.parent
+        / "evals"
+        / "cases"
+        / "clean_change_no_issue"
+    )
+    provider_requests = []
+
+    def fake_get_call_model(provider, *, mock_fixture=None):
+        provider_requests.append((provider, mock_fixture))
+        if provider_result == "provider_error":
+            def call_model(_prompt):
+                raise LLMClientError("provider down secret=must-not-leak")
+
+            return call_model
+        return lambda _prompt: "not json"
+
+    monkeypatch.setattr(review_service, "get_call_model", fake_get_call_model)
+
+    result = eval_runner.run_one_case(
+        case_dir,
+        tmp_path,
+        use_llm=True,
+        llm_provider="mock",
+        review_mode="fixed",
+    )
+
+    assert [provider for provider, _fixture in provider_requests] == ["mock"]
+    assert result["passed"] is False
+    assert result["json_valid"] is False
+    assert result["findings_count"] == 0
+    assert result["false_positive"] is False
+    assert result["error"] == expected_error
+    assert "must-not-leak" not in result["error"]
+    assert result["llm_calls"] == 1
+
+
+def test_fixed_llm_repair_warning_is_not_a_fatal_failure():
+    """Usable repaired output remains valid even when state.errors is non-empty."""
+    state = SimpleNamespace(
+        errors=["llm_finding_0_missing_confidence"],
+        trace_steps=[{
+            "step": "run_llm_review",
+            "detail": {
+                "called": True,
+                "valid": True,
+                "repaired": True,
+                "errors": ["llm_finding_0_missing_confidence"],
+            },
+        }],
+    )
+
+    assert eval_runner._fixed_llm_failure_error(state) == ""
+
+
 def test_run_one_case_passes_context_budget_to_review_agent(tmp_path, monkeypatch):
     """验证 context_budget 能从 run_one_case 透传至 ReviewService.review。
 
@@ -702,8 +769,286 @@ def test_write_baseline_record_does_not_report_a_write_failure_as_success(
         eval_runner.write_baseline_record(output_path, {"metrics": {}})
 
 
-def test_main_rejects_llm_enabled_fixed_baseline(tmp_path, monkeypatch):
-    """固定基线不得和 LLM 启用的运行结果混用。"""
+def test_main_rejects_non_mock_single_baseline_before_side_effects(
+    tmp_path, monkeypatch
+):
+    """A single baseline cannot capture source, run Eval, or reach a real provider."""
+    output_path = tmp_path / "baseline.json"
+    output_path.write_text("existing baseline\n", encoding="utf-8")
+    args = SimpleNamespace(
+        cases="evals/cases",
+        repo=".",
+        llm=True,
+        llm_provider="openai",
+        baseline_output=str(output_path),
+        commit="unknown",
+        worktree_state="unknown",
+        compare_modes=False,
+        comparison_output=None,
+    )
+    calls = []
+
+    def unexpected_call(name):
+        def fail(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} must not run")
+
+        return fail
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        eval_runner, "capture_source_revision", unexpected_call("source_capture")
+    )
+    monkeypatch.setattr(eval_runner, "run_eval", unexpected_call("run_eval"))
+    monkeypatch.setattr(
+        review_service, "get_call_model", unexpected_call("provider_initialization")
+    )
+
+    with pytest.raises(ValueError, match="single_baseline_requires_mock_provider"):
+        eval_runner.main()
+
+    assert calls == []
+    assert output_path.read_text(encoding="utf-8") == "existing baseline\n"
+
+
+def test_main_writes_complete_single_llm_baseline_from_real_eval(
+    tmp_path, monkeypatch
+):
+    """The mock single baseline traverses Eval, aggregation, build, and JSON IO."""
+    cases_dir = Path(__file__).resolve().parent.parent / "evals" / "cases"
+    output_path = tmp_path / "baseline.json"
+    args = SimpleNamespace(
+        cases=str(cases_dir),
+        repo=str(tmp_path),
+        llm=True,
+        llm_provider="mock",
+        baseline_output=str(output_path),
+        commit="abc123",
+        worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
+    )
+    providers = []
+    production_get_call_model = review_service.get_call_model
+
+    def offline_get_call_model(provider, *, mock_fixture=None):
+        providers.append(provider)
+        assert provider == "mock"
+        return production_get_call_model(provider, mock_fixture=mock_fixture)
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(review_service, "get_call_model", offline_get_call_model)
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision(
+            commit="abc123", worktree_state="clean", worktree_diff_sha256=None
+        ),
+    )
+
+    eval_runner.main()
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == "m8_single_baseline.v1"
+    assert record["review_mode"] == "fixed"
+    assert record["commit"] == "abc123"
+    assert record["worktree_state"] == "clean"
+    assert record["worktree_diff_sha256"] is None
+    assert record["configuration"] == {
+        "cases": str(cases_dir),
+        "repo": str(tmp_path),
+        "use_llm": True,
+        "llm_provider": "mock",
+        "context_budget": {
+            "max_prompt_chars": ContextBudget().max_prompt_chars,
+            "max_extra_context_files": ContextBudget().max_extra_context_files,
+        },
+    }
+    assert type(record["environment"]["python_version"]) is str
+    assert type(record["environment"]["platform"]) is str
+    assert "--llm --llm-provider mock" in record["reproduction"]["command"]
+
+    metrics = record["metrics"]
+    integer_metrics = {
+        "cases",
+        "false_positive_count",
+        "negative_case_count",
+        "false_positive_negative_case_count",
+        "false_negative_count",
+        "total_tokens",
+        "total_llm_calls",
+        "unknown_tool_count",
+        "budget_exhausted_count",
+    }
+    float_metrics = {
+        "category_hit_rate",
+        "json_valid_rate",
+        "average_findings",
+        "average_duration_ms",
+        "p95_duration_ms",
+        "precision",
+        "recall",
+        "f1",
+        "false_positive_rate",
+        "estimated_cost_usd",
+    }
+    for field in integer_metrics:
+        assert type(metrics[field]) is int
+    for field in float_metrics:
+        assert type(metrics[field]) is float
+    assert type(metrics["results"]) is list
+    assert metrics["cases"] == len(metrics["results"]) == len(providers) == 6
+
+    bool_result_fields = {
+        "passed",
+        "json_valid",
+        "false_positive",
+        "is_negative_case",
+        "token_usage_available",
+        "react_degraded",
+        "budget_exhausted",
+    }
+    integer_result_fields = {
+        "findings_count",
+        "tp",
+        "fp",
+        "fn",
+        "duration_ms",
+        "llm_calls",
+        "total_tokens",
+        "react_steps",
+        "react_llm_calls",
+        "react_total_tokens",
+        "react_tool_results_truncated",
+        "unknown_tool_count",
+    }
+    string_result_fields = {"case_id", "error", "review_mode", "react_termination_reason"}
+    for result in metrics["results"]:
+        for field in bool_result_fields:
+            assert type(result[field]) is bool
+        for field in integer_result_fields:
+            assert type(result[field]) is int
+        for field in string_result_fields:
+            assert type(result[field]) is str
+        for field in ("expected_categories", "actual_categories"):
+            assert type(result[field]) is list
+            assert all(type(value) is str for value in result[field])
+
+    results = metrics["results"]
+    negative_results = [result for result in results if result["is_negative_case"]]
+    assert len(negative_results) == metrics["negative_case_count"] == 1
+    assert negative_results[0]["case_id"] == "clean_change_no_issue"
+    assert metrics["false_positive_negative_case_count"] == sum(
+        result["false_positive"] for result in negative_results
+    )
+    assert metrics["json_valid_rate"] == pytest.approx(
+        sum(result["json_valid"] for result in results) / len(results)
+    )
+    assert metrics["average_findings"] == pytest.approx(
+        sum(result["findings_count"] for result in results) / len(results)
+    )
+    assert metrics["average_duration_ms"] == pytest.approx(
+        sum(result["duration_ms"] for result in results) / len(results)
+    )
+    assert metrics["p95_duration_ms"] == eval_runner._percentile(
+        [result["duration_ms"] for result in results], 95
+    )
+    assert metrics["total_tokens"] == sum(result["total_tokens"] for result in results)
+    assert metrics["total_llm_calls"] == sum(result["llm_calls"] for result in results)
+    assert record["observability"]["llm_call_count"] == metrics["total_llm_calls"]
+
+
+def test_main_writes_zero_case_single_baseline_with_stable_numeric_types(
+    tmp_path, monkeypatch
+):
+    """An empty case set has a valid JSON shape and explicit zero semantics."""
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+    output_path = tmp_path / "baseline.json"
+    args = SimpleNamespace(
+        cases=str(cases_dir),
+        repo=str(tmp_path),
+        llm=True,
+        llm_provider="mock",
+        baseline_output=str(output_path),
+        commit="abc123",
+        worktree_state="clean",
+        compare_modes=False,
+        comparison_output=None,
+    )
+
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        review_service,
+        "get_call_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty Eval must not initialize a provider")
+        ),
+    )
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision(
+            commit="abc123", worktree_state="clean", worktree_diff_sha256=None
+        ),
+    )
+
+    eval_runner.main()
+
+    metrics = json.loads(output_path.read_text(encoding="utf-8"))["metrics"]
+    assert metrics["results"] == []
+    for field in (
+        "cases",
+        "false_positive_count",
+        "negative_case_count",
+        "false_positive_negative_case_count",
+        "false_negative_count",
+        "total_tokens",
+        "total_llm_calls",
+        "unknown_tool_count",
+        "budget_exhausted_count",
+    ):
+        assert type(metrics[field]) is int
+        assert metrics[field] == 0
+    for field in (
+        "category_hit_rate",
+        "json_valid_rate",
+        "average_findings",
+        "average_duration_ms",
+        "p95_duration_ms",
+        "precision",
+        "recall",
+        "f1",
+        "false_positive_rate",
+        "estimated_cost_usd",
+    ):
+        assert type(metrics[field]) is float
+        assert metrics[field] == 0.0
+
+
+def test_run_eval_counts_fixed_llm_call_from_real_review_trace(tmp_path):
+    """The production eval path records the one fixed LLM call without fake tokens."""
+    cases_dir = Path(__file__).resolve().parent.parent / "evals" / "cases"
+
+    metrics = eval_runner.run_eval(
+        cases_dir,
+        tmp_path,
+        use_llm=True,
+        llm_provider="mock",
+        review_mode="fixed",
+    )
+
+    assert metrics["cases"] == 6
+    assert metrics["total_llm_calls"] == 6
+    assert metrics["total_tokens"] == 0
+    assert all(result["llm_calls"] == 1 for result in metrics["results"])
+    negative = [result for result in metrics["results"] if result["is_negative_case"]]
+    assert len(negative) == 1
+    assert negative[0]["case_id"] == "clean_change_no_issue"
+
+
+def test_main_does_not_write_single_baseline_when_eval_fails(tmp_path, monkeypatch):
+    """An Eval exception must propagate before any baseline artifact is written."""
     output_path = tmp_path / "baseline.json"
     args = SimpleNamespace(
         cases="evals/cases",
@@ -716,21 +1061,24 @@ def test_main_rejects_llm_enabled_fixed_baseline(tmp_path, monkeypatch):
         compare_modes=False,
         comparison_output=None,
     )
-
-    calls = []
-
-    def unexpected_run_eval(**kwargs):
-        calls.append(kwargs)
-        raise AssertionError("invalid fixed baseline must not start Eval")
-
     monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
-    monkeypatch.setattr(eval_runner, "run_eval", unexpected_run_eval)
+    monkeypatch.setattr(
+        eval_runner,
+        "capture_source_revision",
+        lambda repo_root, **kwargs: eval_runner.SourceRevision(
+            commit="abc123", worktree_state="clean", worktree_diff_sha256=None
+        ),
+    )
+    monkeypatch.setattr(
+        eval_runner,
+        "run_eval",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("eval failed")),
+    )
 
-    with pytest.raises(ValueError, match="fixed_baseline_requires_llm_disabled"):
+    with pytest.raises(RuntimeError, match="eval failed"):
         eval_runner.main()
 
     assert not output_path.exists()
-    assert calls == []
 
 
 def test_main_writes_a_readable_fixed_baseline_with_reproduction_command(

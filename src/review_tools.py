@@ -136,10 +136,26 @@ class ToolDispatcher:
         return self._tools.get(tool_name)
 
     def dispatch(self, tool_name: str, arguments: JSONValue) -> ToolResult:
-        """Invoke a registered tool only after its local schema admits ``arguments``."""
+        """Invoke a registered tool only after its local schema admits ``arguments``.
+
+        这是一个典型的“闸口（gate）”模式：在真正调用工具逻辑之前，先依次做三道
+        校验，任何一道不通过都直接返回一个安全的结构化失败结果，而绝不会把原始
+        异常、内部诊断或模型臆造的参数泄露给模型或上层。
+
+        三段闸口顺序（前置条件越靠前越“廉价”，优先拦截明显非法输入）：
+          1) 工具名本身合法（非空字符串）——避免用非法值当 dict 键；
+          2) 工具已注册（存在）——避免未知工具名造成不可预期行为；
+          3) 入参整体符合该工具登记的 JSON schema——阻止模型塞入未声明字段。
+        全部通过后才真正执行工具，并对工具抛出的任何异常统一降级为 internal_error。
+        """
+        # 闸口 1：工具名是路由键，属于不可信输入，必须先校验类型与非空。
+        # 若直接用 None/空串当 dict.get 的键，既无意义也可能被利用做指纹探测。
         if not isinstance(tool_name, str) or not tool_name:
             # Routing input is untrusted; validate it before using it as a dict key.
             return self._invalid_arguments_result()
+
+        # 闸口 2：查表确认该工具名确实被注册过。未注册说明模型编造了工具名，
+        # 返回 not_found 而非执行任何逻辑，保持“能力白名单”的闭合性。
         tool = self.get(tool_name)
         if tool is None:
             return ToolResult(
@@ -150,17 +166,27 @@ class ToolDispatcher:
                 result_size=0,
                 result_limit=0,
             )
+
+        # 闸口 3：对模型传入的 arguments 做 schema 校验（白名单 + 必填 + 类型）。
+        # 这是最关键的防线：模型无法通过新增工具未声明的参数来“扩展”工具能力
+        # （例如往 read_file_context 里塞一个出乎意料的 "mode" 字段做参数注入）。
         if not self._arguments_match_schema(arguments, tool.parameters_schema):
             # Models cannot expand a tool's capability by adding undeclared arguments.
             return self._invalid_arguments_result(
                 "The tool arguments do not match the registered schema."
             )
 
+        # 三道闸口全部通过 → 真正执行工具逻辑。
         try:
             result = tool.run(arguments)
         except Exception:
+            # 工具执行期的任何异常都被吞掉并转成稳定的 internal_error。
+            # 关键点：工具的原始异常信息（可能含主机路径、内部栈帧）绝不下发到模型，
+            # 仅作为“日志侧”信息保留在别处；模型端只看到不可变的失败码。
             # Tool diagnostics are log-only; callers receive a stable safe failure.
             return self._internal_error_result()
+        # 双重保险：即便工具内部实现有 bug，返回的不是 ToolResult 也视为内部错误，
+        # 防止形状不符的对象泄漏到上层控制器。
         if not isinstance(result, ToolResult):
             return self._internal_error_result()
         return result
@@ -189,32 +215,42 @@ class ToolDispatcher:
 
     @staticmethod
     def _object_matches_schema(value: JSONValue, schema: dict[str, JSONValue]) -> bool:
-        """Validate every object level so nested keys cannot bypass the whitelist."""
+        """Validate every object level so nested keys cannot bypass the whitelist.
+
+        这是模式校验的核心：一个对象 schema 必须在“白名单”语义下被满足才算合法。
+        所谓白名单语义，即：只有 schema 里显式声明的字段才被允许，任何额外字段、
+        缺失的必填字段、类型不符的字段都直接判非法。逐层递归（包括嵌套对象/数组）
+        确保连深层字段都无法绕过校验。
+        """
         if not isinstance(value, dict) or schema.get("additionalProperties") is not False:
-            # 硬性要求 schema 显式声明 additionalProperties=False：这是安全白名单的
-            # 关键防线。若允许额外属性，模型可在 tools 参数里塞入工具未声明、系统未
-            # 预期的字段（参数注入），从而扩大攻击面。因此“未明确禁止额外属性”即判不合法。
+            # 合法性前提 1：入参必须是 dict。
+            # 合法性前提 2：schema 必须显式声明 additionalProperties=False。
+            #   这是安全白名单的关键防线。若允许额外属性，模型可在 tools 参数里塞入
+            #   工具未声明、系统未预期的字段（参数注入），从而扩大攻击面。
+            #   因此“未明确禁止额外属性”即判不合法——宁可误杀也不放行未知字段。
             return False
 
         properties = schema.get("properties")
         required = schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
             return False
-        # required 中的每个名字都必须是字符串且确实在 properties 中声明过，
-        # 防止 schema 自身自相矛盾（声明必填却没定义该字段）。
+        # 防御 schema 自身自相矛盾：required 里的每个名字必须是字符串且确实在
+        # properties 中声明过，否则该 schema 本身不可信（声明必填却没定义字段）。
         if not all(isinstance(name, str) and name in properties for name in required):
             return False
-        # properties 的每个字段名与规则本身都必须是合法的（名是字符串、规则是 dict）。
+        # 防御 properties 自身结构不合法：字段名必须是字符串、对应规则必须是 dict。
         if not all(isinstance(name, str) and isinstance(rule, dict) for name, rule in properties.items()):
             return False
-        # 入参缺失任一 required 字段 → 不合法（契约不可违反）。
+        # 契约校验 1：入参缺失任一 required 字段 → 不合法（必填项不可违反）。
         if any(name not in value for name in required):
             return False
-        # 入参多出任何 properties 之外的字段 → 不合法（白名单之外一律拒绝）。
+        # 契约校验 2：入参多出任何 properties 之外的字段 → 不合法（白名单之外一律拒绝）。
         if any(name not in properties for name in value):
             return False
 
-        # 逐字段递归校验：仅对“实际出现的字段”做 schema 匹配，嵌套结构同样受白名单约束。
+        # 逐字段递归校验：仅对“实际出现的字段”做 schema 匹配。
+        # 注意这里按 properties 遍历，嵌套对象/数组会再次进入 _value_matches_schema，
+        # 从而嵌套结构同样受白名单约束，不会因层级加深而漏检。
         return all(
             ToolDispatcher._value_matches_schema(value[name], rule)
             for name, rule in properties.items()
@@ -396,31 +432,47 @@ class FinishReview:
         )
 
     def _validated_issue(self, candidate: JSONValue) -> ReviewIssue | None:
-        """Return one strict, locatable finding through the existing validation chain."""
+        """Return one strict, locatable finding through the existing validation chain.
+
+        这是“永不信任模型文本”原则的关键实现：模型在 finish_review 里提交的每一条
+        candidate，都必须经过与正式流水线完全相同的校验闸门，任一环节不过关就丢弃
+        该条（返回 None），且绝不会把原始模型文本直接当作发现（finding）透传出去。
+        """
+        # 校验 1：candidate 的结构必须符合 finish_review 的参数 schema（白名单 + 必填）。
         # One malformed candidate must not invalidate other terminal findings.
         if not ToolDispatcher._arguments_match_schema(
             {"findings": [candidate]}, self.parameters_schema
         ):
             return None
         try:
+            # 把单条 candidate 包装成 LLM 响应文本格式，复用既有解析器做结构归一化。
             response_text = json.dumps({"findings": [candidate]}, allow_nan=False)
         except (TypeError, ValueError):
+            # 无法序列化为 JSON（含 NaN/非 JSON 类型）即非法。
             return None
+        # 校验 2：用正式 LLM 响应解析器解析，得到结构化的 ReviewIssue 列表 + 校验结果。
         issues, validation = parse_llm_response(response_text)
+        # 校验 3：必须 valid 且未被“修复（repaired）”，且恰好解析出 1 条。
+        #   - 不 valid → 结构/语义不满足；
+        #   - repaired → 说明原文本有问题、被兜底修补过，这种“凑数”结果不可作为终态发现；
+        #   - 不等于 1 条 → 与“单条 candidate”的预期不符，直接丢弃以免错位。
         if not validation.valid or validation.repaired or len(issues) != 1:
             return None
 
-        # parse_llm_response assigns category="llm" uniformly.  A terminal
-        # finding may carry an explicit review category (e.g.
-        # exception_handling), so preserve the candidate's category when
-        # present instead of forcing every finish_review finding to "llm".
+        # parse_llm_response 会统一把 category 设为 "llm"。但终端发现可能携带显式审查
+        # 类别（如 exception_handling）。这里保留候选里自带的 category，而不是把每条
+        # finish_review 发现都强制成 "llm"，以保留更细的类别信号。
         candidate_category = (
             candidate.get("category") if isinstance(candidate, dict) else None
         )
         if isinstance(candidate_category, str) and candidate_category:
             issues[0].category = candidate_category
 
+        # 校验 4：行号定位必须落在变更文件的实际改动范围内（剔除幻觉行号）。
         issue = validate_issue_locations(issues, self._changed_files)[0]
+        # 终态发现要求 placement == "inline"（能精确定位到具体行）。
+        # 对遗留流水线来说，把发现降级成“文件级/摘要级”是允许的；但对一次显式的
+        # 终态发现而言，定位落空等同于没有证据，因此这里直接丢弃（返回 None）。
         # A summary downgrade is safe for the legacy pipeline but not for an explicit terminal finding.
         return issue if issue.placement == "inline" else None
 
@@ -793,25 +845,46 @@ def _normalize_file_context_path(path: str) -> str:
 
 
 def _extract_hunks(changed_file: ChangedFile) -> list[tuple[DiffHunk, str]]:
-    """Split retained patch text into hunk records without consulting the worktree."""
+    """Split retained patch text into hunk records without consulting the worktree.
+
+    设计要点：本函数不读取仓库工作区（worktree），只操作已解析并保存在
+    ``changed_file.patch`` 里的纯文本。它把“解析后的 hunk 区间（DiffHunk 对象）”
+    与“原始 patch 文本中对应的 hunk 片段”逐段配对，供 ChangedHunksTool 输出。
+
+    为什么要做一致性核对而不是简单切片？因为解析器（diff_parser）产生的行号
+    区间必须与 patch 文本里 @@ 头声明的区间完全一致，否则意味着 patch 文本在
+    传输/存储中被破坏或存在对抗性篡改。一旦对不上，就返回空列表，绝不输出
+    可能错位的代码片段——错位代码会误导模型做出错误判断。
+    """
+    # 按行拆分 patch 文本，并找出所有 hunk 头（以 "@@" 开头的行）所在行号。
     patch_lines = changed_file.patch.splitlines()
     header_indexes = [index for index, line in enumerate(patch_lines) if line.startswith("@@")]
+
+    # 一致性核对 1：hunk 头数量必须等于已解析的 hunks 数量。
+    # 数量不一致说明文本与解析结果脱节（例如 patch 被截断导致少了一个 @@ 头）。
     if len(header_indexes) != len(changed_file.hunks):
         # A malformed patch cannot be safely associated with parsed line ranges.
         return []
 
     extracted: list[tuple[DiffHunk, str]] = []
+    # 逐个 hunk 配对：第 i 个 hunk 的文本范围 = 第 i 个 @@ 头 到 第 i+1 个 @@ 头之间。
     for index, hunk in enumerate(changed_file.hunks):
         start = header_indexes[index]
+        # 最后一个 hunk 的结束取 patch 末尾；其余取下一个 @@ 头之前。
         end = header_indexes[index + 1] if index + 1 < len(header_indexes) else len(patch_lines)
         header = patch_lines[start]
+        # 用正则从 "@@ -a,b +c,d @@" 中提取新文件的起始行 c 与行数 d。
         match = _HUNK_HEADER_RE.search(header)
         if match is None:
             return []
         parsed_start = int(match.group(1))
+        # group(2) 是行数（缺省为 1，即单行改动）。end = start + 行数 - 1。
         parsed_end = parsed_start + int(match.group(2) or 1) - 1
+        # 一致性核对 2：patch 文本 @@ 头声明的区间必须与 DiffHunk 记录的行号区间一致。
+        # 不一致说明解析结果与文本矛盾，直接放弃整个文件，避免输出错位片段。
         if (parsed_start, parsed_end) != (hunk.start_line, hunk.end_line):
             return []
+        # 配对成功：保存 (DiffHunk, 对应 patch 文本片段)。
         extracted.append((hunk, "\n".join(patch_lines[start:end])))
     return extracted
 

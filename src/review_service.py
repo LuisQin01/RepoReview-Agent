@@ -458,6 +458,9 @@ class ReviewService:
         )
 
         # 步骤5：run_llm_review —— 可选的 LLM 审查步骤
+        # 按 review_mode 显式分流：react 走工具调用循环，fixed 走单次 LLM 审查。
+        # 关键约束（非目标）：react 失败时绝不静默回退到 fixed 流水线，而是显式
+        # 降级（react_degraded=True，返回空 findings），避免把“失败”伪装成“成功审查”。
         # Branch on review_mode so the react path is explicit and never a silent fallback.
         if state.use_llm and state.review_mode == "react":
             step_started_at_perf = perf_counter()

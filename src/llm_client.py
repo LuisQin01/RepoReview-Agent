@@ -25,11 +25,42 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from functools import partial
 from typing import Mapping, Sequence
 
 from .model_protocol import JSONValue, ModelProtocolError, ModelResponse, ToolCall
+
+# 可选加载 .env：便于本地用 .env 文件提供密钥，不覆盖已有的系统环境变量或 CI 注入。
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    # python-dotenv 未安装或 .env 不存在时静默跳过，仍可用系统环境变量。
+    pass
+
+
+def _log(msg: str, *args) -> None:
+    """向 stderr 打印一行诊断信息（绝不写 stdout，避免污染最终的 report 产物）。
+
+    所有诊断一律走 stderr；report 走 stdout，这样即使把 stdout 管道接给
+    其他程序，诊断信息也不会混进 report 文本里。本函数不打印任何密钥
+    （API key 由调用方负责脱敏后再传入）。
+    """
+    if args:
+        msg = msg % args
+    print(f"[llm_client] {msg}", file=sys.stderr)
+
+
+# 复用 trace 的脱敏函数，确保日志里的异常文本不会泄露 key/token。
+# 用防御性导入，避免极端加载顺序下的循环依赖导致模块不可用。
+try:
+    from .trace import sanitize_trace_text
+except Exception:  # pragma: no cover - 防御性兜底
+    def sanitize_trace_text(text):  # type: ignore
+        return text
 
 
 # 默认单次请求超时（秒）：平衡响应速度与偶发慢请求容忍度
@@ -167,13 +198,15 @@ class OpenAIModelProvider:
         if not api_key:
             raise LLMConfigurationError("missing_OPENAI_API_KEY")
         model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        # 可选：OpenAI 兼容端点的 base_url（如代理、Azure、本地服务）。未设置时走官方默认。
+        base_url = os.getenv("OPENAI_BASE_URL") or None
 
         try:
             # Lazy import: only the real ReAct path needs the SDK package.
             from openai import OpenAI
 
             # max_retries=0: the controller owns retry policy, not the SDK.
-            client = OpenAI(api_key=api_key, timeout=self._timeout_seconds, max_retries=0)
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=self._timeout_seconds, max_retries=0)
             input_items = self._convert_request_to_input(request)
             create_kwargs: dict[str, object] = {
                 "model": model,
@@ -417,16 +450,38 @@ def real_call_model(prompt: str, *, timeout_seconds: float = DEFAULT_TIMEOUT_SEC
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        # 配置错误：连网络都没发，先明确告知，避免上游把它当成“空结果”误判成功
+        _log("[FAIL] 调用中止：未设置 OPENAI_API_KEY（base_url / model 已忽略，不会发起任何请求）")
         raise LLMConfigurationError("missing_OPENAI_API_KEY")
 
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    # 可选：OpenAI 兼容端点的 base_url（如代理、Azure、本地服务）。未设置时走官方默认。
+    base_url = os.getenv("OPENAI_BASE_URL") or None
 
+    # 发起请求前打印关键参数（不含 key），便于核对“到底打到了哪个端点/哪个模型”
+    _log(
+        "-> 请求参数：model=%s base_url=%s prompt_chars=%d timeout=%.1fs",
+        model,
+        base_url or "<official openai default>",
+        len(prompt),
+        timeout_seconds,
+    )
+    started_at = time.perf_counter()
     try:
         # 延迟导入 openai：仅在真实调用路径需要，避免 mock 路径强依赖该包
         from openai import OpenAI
 
+        # 仅在显式配置了 base_url 时才传入，避免向 SDK 发送 base_url=None，
+        # 同时也让“未设置 base_url”与“官方默认”在构造参数上保持一致。
+        client_kwargs = {
+            "api_key": api_key,
+            "timeout": timeout_seconds,
+            "max_retries": 0,
+        }
+        if base_url:
+            client_kwargs["base_url"] = base_url
         # max_retries=0 关闭 SDK 内置重试，统一由 call_with_retries 控制，避免双层重试导致等待时间不可控
-        client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
+        client = OpenAI(**client_kwargs)
         response = client.responses.create(
             model=model,
             input=[
@@ -441,17 +496,42 @@ def real_call_model(prompt: str, *, timeout_seconds: float = DEFAULT_TIMEOUT_SEC
             ],
             timeout=timeout_seconds,
         )
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
         # 空响应视为客户端错误（不可重试），避免重试无意义地空转
         if not response.output_text:
+            _log("[FAIL] 调用成功返回，但响应文本为空（openai_empty_response）")
             raise LLMClientError("openai_empty_response")
 
+        usage = getattr(response, "usage", None)
+        usage_str = ""
+        if usage is not None:
+            usage_str = " usage=in:%s/out:%s/total:%s" % (
+                getattr(usage, "input_tokens", "?"),
+                getattr(usage, "output_tokens", "?"),
+                getattr(usage, "total_tokens", "?"),
+            )
+        _log(
+            "<- 调用成功：耗时 %.0fms 返回 %d 字符%s",
+            elapsed_ms,
+            len(response.output_text),
+            usage_str,
+        )
         return response.output_text
     except LLMClientError:
         # 已是体系内异常，原样向上抛出，避免被下面的分类逻辑二次包装
         raise
     except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
         # 其余异常按“是否可重试”分流为对应异常类型，统一带 openai_call_failed: 前缀便于排查
         error_type = LLMRetryableError if _is_retryable_provider_error(exc) else LLMClientError
+        # 异常文本经脱敏后再打印，防止 key/token 通过报错泄露到 stderr
+        _log(
+            "[FAIL] 调用失败（耗时 %.0fms）：%s: %s -> 归类为 %s",
+            elapsed_ms,
+            type(exc).__name__,
+            sanitize_trace_text(str(exc)),
+            "可重试(retryable)" if error_type is LLMRetryableError else "致命(fatal)",
+        )
         raise error_type(f"openai_call_failed:{exc}") from exc
 
 
@@ -556,8 +636,14 @@ def get_call_model(
     """
     # 按 provider 创建底层 call_model（不含重试）
     if provider == "mock":
+        # mock 模式不做任何网络请求；默认静音，仅 LLM_VERBOSE=1 时提示，
+        # 避免污染 mock 路径的测试输出。
+        if os.getenv("LLM_VERBOSE"):
+            _log("provider=mock → 不发起任何网络请求，仅使用本地夹具 fixture=%s", mock_fixture)
         call_model = make_mock_call_model(mock_fixture)
     elif provider == "openai":
+        # 明确告知“即将发起真实网络请求”，便于事后确认没有误走 mock。
+        _log("provider=openai -> 即将发起真实网络请求到 OpenAI 兼容 API（非 mock）")
         # 用 partial 固定 timeout_seconds，得到 (prompt)->str 签名，与 mock 对齐
         call_model = partial(real_call_model, timeout_seconds=timeout_seconds)
     else:

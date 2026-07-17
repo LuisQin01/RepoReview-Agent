@@ -245,6 +245,9 @@ def test_openai_call_applies_timeout_to_client_and_request(monkeypatch):
             self.responses = FakeResponses()
 
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    # 隔离 base_url：显式移除，使 client 构造参数不含 base_url 分支，
+    # 避免本地 .env 的 OPENAI_BASE_URL 污染断言（base_url 仅在显式配置时才传入）。
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     # 将 openai 模块替换为含 FakeOpenAI 的替身，模拟真实导入
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
     call_model = get_call_model("openai", timeout_seconds=7.5, max_attempts=1)

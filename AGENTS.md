@@ -13,8 +13,9 @@ explainable, validated, safe to publish, and reproducible from recorded input.
   the source of truth for the task's goal, dependencies, non-goals, code
   locations, acceptance evidence, and milestone-specific design.
 - For work governed by `新增里程碑.md`, read the complete applicable task card
-  before editing. Read `项目提示词优化.md` for teaching/design-only work or a
-  formal acceptance review.
+  before editing. Read `项目提示词优化.md` for teaching/design background; the
+  formal long-term rules are `docs/workflows/implementation.md`,
+  `docs/workflows/acceptance.md`, and `docs/workflows/repair.md`.
 - Do not infer an API, test, dependency, or planned capability from a task
   title or documentation; confirm it from the repository.
 
